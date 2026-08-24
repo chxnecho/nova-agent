@@ -1,0 +1,20 @@
+# --- secrets & local state ---
+.env
+.nova/
+*.sqlite3
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# --- editors ---
+.idea/
+.vscode/
+.DS_Store

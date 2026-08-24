@@ -1,0 +1,48 @@
+# NovaAgent default configuration.
+# Values can be overridden by environment variables (prefix NOVA_, nested keys joined by __)
+# e.g. NOVA_LLM__MODEL=openai/gpt-4o-mini
+
+llm:
+  provider: openrouter          # openrouter | openai-compatible | mock
+  model: stealth/ox-alpha       # default model; region-verified alternatives:
+                                # deepseek/deepseek-chat-v3.1, qwen/qwen3-235b-a22b
+  temperature: 0.7
+  max_tokens: 4096
+  # OpenRouter is OpenAI-compatible; base_url may be overridden for other gateways
+  base_url: https://openrouter.ai/api/v1
+
+agent:
+  max_steps: 40                 # hard cap on think-act iterations per run
+  max_cost_usd: 2.0             # budget guard per run
+  reflect_on_error: true        # enable self-reflection after tool failures
+  system_prompt_file: null      # optional path to a custom system prompt
+
+memory:
+  enabled: true
+  db_path: .nova/memory.sqlite3
+  embedding:
+    provider: hash              # hash = deterministic local fallback, no network needed
+    dim: 512
+  top_k: 5
+  context_window_messages: 24   # short-term window before summarization kicks in
+  summarize_threshold: 32
+
+tools:
+  shell:
+    enabled: true
+    timeout_seconds: 60
+    allow_network: true
+  python_repl:
+    enabled: true
+    timeout_seconds: 30
+  web:
+    enabled: true
+    timeout_seconds: 30
+
+server:
+  host: 127.0.0.1
+  port: 8321
+
+logging:
+  level: INFO
+  dir: .nova/logs
