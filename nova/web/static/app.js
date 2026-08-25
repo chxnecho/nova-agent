@@ -6,7 +6,7 @@ const input = $("input"), sendBtn = $("sendBtn");
 const pill = $("statusPill"), modelInfo = $("modelInfo"), tokenInfo = $("tokenInfo");
 const convoList = $("convoList"), convTitle = $("convTitle");
 const verInfo = $("verInfo");
-const UI_VERSION = "v12-local";
+const UI_VERSION = "v13-sec";
 
 let sessionId = null;
 let busy = false;
@@ -172,10 +172,29 @@ function setStatus(state, text) {
   pill.textContent = text;
 }
 
+// Optional bearer-token auth: if the server enables NOVA_WEB_TOKEN, every
+// /api call needs "Authorization: Bearer <token>". On 401 we prompt once,
+// cache the token in localStorage and retry.
+let authToken = localStorage.getItem("nova_token") || "";
+
+async function apiFetch(path, opts = {}, retried = false) {
+  const headers = Object.assign({"Content-Type": "application/json"}, opts.headers);
+  if (authToken) headers["Authorization"] = "Bearer " + authToken;
+  const r = await fetch(path, Object.assign({}, opts, {headers}));
+  if (r.status === 401 && !retried) {
+    const t = prompt("此服务已开启访问控制,请输入访问令牌 (NOVA_WEB_TOKEN):");
+    if (t === null) return r;
+    authToken = t.trim();
+    localStorage.setItem("nova_token", authToken);
+    return apiFetch(path, opts, true);
+  }
+  return r;
+}
+
 async function createSession(retries = 6) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const r = await fetch("/api/sessions", { method: "POST" });
+      const r = await apiFetch("/api/sessions", { method: "POST" });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const j = await r.json();
       sessionId = j.session_id;
@@ -220,7 +239,7 @@ function renderConvoList() {
 
 function deleteConversation(id) {
   // local removal + best-effort server-side sync
-  fetch("/api/sessions/" + id, { method: "DELETE" }).catch(() => {});
+  apiFetch("/api/sessions/" + id, { method: "DELETE" }).catch(() => {});
   conversations = conversations.filter(c => c.id !== id);
   saveConvos();
   renderConvoList();
@@ -259,7 +278,7 @@ async function switchConversation(id) {
 
   // fall back to the server's in-memory history, then cache it locally
   try {
-    const r = await fetch("/api/history/" + id);
+    const r = await apiFetch("/api/history/" + id);
     if (r.status === 404) {           // server restarted; session gone
       conversations = conversations.filter(x => x.id !== id);
       saveConvos();
@@ -373,7 +392,7 @@ async function sendMessage() {
     bodyEl().classList.remove("cursor");
     clearWaiting();
     persistBotMessage(acc);                  // auto-save the final answer locally
-    fetch("/api/stats/" + sessionId).then(r => r.json()).then(s => {
+    apiFetch("/api/stats/" + sessionId).then(r => r.json()).then(s => {
       tokenInfo.textContent = "tokens: " + s.total_tokens;
       modelInfo.textContent = "model: " + s.model;
     }).catch(() => {});
@@ -387,7 +406,7 @@ async function sendMessage() {
   //   new server -> JSON {"run_id"} then poll /api/events/{sid}/{rid}
   //   old server -> the POST itself returns the SSE event stream
   let resp;
-  const postChat = () => fetch("/api/chat/" + sessionId, {
+  const postChat = () => apiFetch("/api/chat/" + sessionId, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message: text }),
@@ -463,7 +482,7 @@ async function sendMessage() {
     while (!finished) {
       let j;
       try {
-        const r = await fetch(`/api/events/${sessionId}/${runId}?after=${idx}`);
+        const r = await apiFetch(`/api/events/${sessionId}/${runId}?after=${idx}`);
         if (r.status === 404) throw new Error("run lost");
         if (!r.ok) throw new Error("HTTP " + r.status);
         j = await r.json();
@@ -545,7 +564,7 @@ async function sendMessage() {
 /* stop: tell the server to finish the run gracefully. The stream stays open
    until the server emits final+done, so the UI never misses the outcome. */
 function requestStop() {
-  fetch("/api/stop/" + sessionId, { method: "POST" }).catch(() => {});
+  apiFetch("/api/stop/" + sessionId, { method: "POST" }).catch(() => {});
 }
 
 /* ---------------- composer & init ---------------- */

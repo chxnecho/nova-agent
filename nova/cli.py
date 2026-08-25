@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -131,6 +132,9 @@ def main() -> None:
     serve_p.add_argument("--port", type=int, default=None)
     serve_p.add_argument("--no-open", action="store_true",
                          help="Do not auto-open the browser")
+    serve_p.add_argument("--workspace", default=".",
+                         help="Directory the web agent may read/write/execute in. "
+                              "Use a dedicated sandbox directory in production.")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -153,6 +157,16 @@ def main() -> None:
         port = args.port or int(cfg.get("server.port", 8321))
         url = f"http://{host}:{port}"
         print(f"NovaAgent web UI: {url}")
+        print(f"Agent workspace : {workspace.resolve()}")
+        if (workspace.resolve() / ".env").exists():
+            print("\033[31mWARNING: the workspace contains a .env file — the agent can "
+                  "read it. Use --workspace to point at a dedicated sandbox directory.\033[0m")
+        if os.environ.get("NOVA_WEB_TOKEN") or cfg.get("server.auth_token"):
+            print("API auth        : enabled (Bearer token required)")
+        elif host not in ("127.0.0.1", "localhost"):
+            print("\033[33mWARNING: no NOVA_WEB_TOKEN set — anyone who can reach this "
+                  "port can use your API key and run commands. Set NOVA_WEB_TOKEN "
+                  "or keep the server on 127.0.0.1 behind a reverse proxy.\033[0m")
 
         if not args.no_open:
             def open_when_ready() -> None:
@@ -169,7 +183,8 @@ def main() -> None:
                 print("(server did not become ready; open the URL manually)")
 
             threading.Thread(target=open_when_ready, daemon=True).start()
-        uvicorn.run(create_app(cfg), host=host, port=port, log_level="info")
+        uvicorn.run(create_app(cfg, workspace=workspace), host=host, port=port,
+                    log_level="info")
         code = 0
     else:
         code = asyncio.run(cmd_chat(cfg, workspace))

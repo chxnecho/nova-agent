@@ -8,7 +8,7 @@
 |---|---|
 | **Agent 内核** | think → act → observe 自主循环;工具调用;失败后自动反思纠错;步数/成本双预算守卫;JSONL trace 全程留痕 |
 | **LLM 抽象层** | OpenAI 兼容接口(OpenRouter/OpenAI/vLLM 等);流式 SSE 输出;指数退避重试;token 用量统计 |
-| **工具系统** | 注册表 + JSON Schema;内置 9 个工具:`read_file` / `write_file` / `edit_file` / `list_dir`(沙箱)、`run_shell`(超时+黑名单)、`python_repl`(子进程隔离)、`web_fetch`、`remember` / `recall` / `ingest_document` / `search_knowledge` |
+| **工具系统** | 注册表 + JSON Schema;内置 11 个工具:`read_file` / `write_file` / `edit_file` / `list_dir`(沙箱)、`run_shell`(超时+黑名单)、`python_repl`(子进程隔离)、`web_fetch`、`remember` / `recall` / `ingest_document` / `search_knowledge` |
 | **记忆 & RAG** | SQLite 向量存储 + 特征哈希嵌入(零外部依赖);文档分块索引;跨会话持久化 |
 | **多智能体** | Planner 分解任务 → 多个 Executor 依次执行 → Critic 审查,不通过则修订重试(可配轮数),最后综合报告 |
 | **Web 界面** | FastAPI + SSE 流式后端;单页聊天 UI 实时显示思考过程和每次工具调用 |
@@ -76,9 +76,33 @@ nova/
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # 26 个单元测试,全部离线运行(MockProvider)
+.venv/bin/python -m pytest tests/ -q     # 35 个单元测试,全部离线运行(MockProvider)
 scripts/smoke_llm.py                     # 真实 API 冒烟测试(消耗少量 token)
 ```
+
+## 生产部署
+
+```bash
+# 1. 专用沙箱工作区(不要指向含 .env / 密钥的目录)
+nova serve --host 0.0.0.0 --workspace /srv/nova-sandbox
+
+# 2. 开启 API 访问控制(浏览器会自动弹出令牌输入框)
+export NOVA_WEB_TOKEN="$(openssl rand -hex 24)"
+
+# 3. 生产环境建议置于 Nginx/Caddy 反代之后(TLS + 额外访问控制)
+```
+
+部署注意事项:
+
+- **认证**:设置 `NOVA_WEB_TOKEN` 后所有 `/api/*` 端点要求 `Authorization: Bearer <token>`;
+  未设置时服务只应绑定 `127.0.0.1`(启动时会给出醒目警告)。
+- **工作区隔离**:web 模式下 Agent 的文件/Shell/REPL 工具锁定在 `--workspace` 目录内,
+  启动时若检测到该目录含 `.env` 会红色告警。
+- **资源治理**:空闲会话 1 小时后自动回收,已完成运行的事件缓冲保留 10 分钟,
+  会话总数上限 200(超出时淘汰最旧),无需手动清理。
+- **已知边界**:`web_fetch` 目前允许抓取任意 URL(含内网地址)。面向公网部署时,
+  建议在反向代理层限制出站目标,或在内网环境中禁用该工具(`config/default.yaml`
+  中 `tools.web.enabled: false`)。
 
 ## 设计取舍说明
 

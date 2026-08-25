@@ -21,6 +21,30 @@ def make_app():
     return create_app(cfg)
 
 
+def test_auth_required_when_token_set(monkeypatch):
+    """With NOVA_WEB_TOKEN set, /api endpoints demand the bearer token,
+    while the page and static assets stay publicly loadable."""
+    monkeypatch.setenv("NOVA_WEB_TOKEN", "s3cret")
+    app = make_app()
+    client = TestClient(app)
+
+    assert client.get("/api/history/nope").status_code == 401
+    assert (client.get("/api/history/nope",
+                       headers={"Authorization": "Bearer wrong"}).status_code == 401)
+    # page itself is still public so the browser can render the UI
+    assert client.get("/").status_code == 200
+    # correct token passes through to normal handling (404: unknown session)
+    r = client.get("/api/history/nope", headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 404
+
+
+def test_no_auth_when_token_unset(monkeypatch):
+    monkeypatch.delenv("NOVA_WEB_TOKEN", raising=False)
+    client = TestClient(make_app())
+    r = client.get("/api/history/nope")
+    assert r.status_code == 404          # reaches handler: unknown session, not 401
+
+
 def test_index_page_served():
     client = TestClient(create_app(Config({"memory": {"enabled": False}})))
     r = client.get("/")

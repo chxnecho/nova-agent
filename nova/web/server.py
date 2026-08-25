@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -60,32 +62,83 @@ class ChatRun:
         self.notify.set()
 
     def mark_done(self) -> None:
+        self.finished_at = time.monotonic()
         self.emit({"type": "done"})   # terminal event for clients
         self.done = True
         self.notify.set()
 
 
 class Session:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, workspace: str | Path = "."):
         try:
             key = api_key_for(cfg)
         except RuntimeError:
             key = ""  # mock provider needs no key
         self.provider = create_provider_from_config(cfg, key)
-        self.agent = build_default_agent(cfg, self.provider)
+        self.agent = build_default_agent(cfg, self.provider, workspace=workspace)
         self.agent.reset()
         self.running = False
         self.runs: dict[str, ChatRun] = {}
         self.active_run: ChatRun | None = None
-        self.active_run: ChatRun | None = None
+        self.last_used = time.monotonic()
+
+SESSION_IDLE_TTL = 3600.0      # discard idle sessions after 1 h
+RUN_RETENTION = 600.0          # keep a finished run's event buffer for 10 min
+MAX_SESSIONS = 200             # hard cap; oldest idle sessions are evicted
 
 
-def create_app(cfg: Config | None = None) -> FastAPI:
+def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAPI:
     cfg = cfg or load_config()
     app = FastAPI(title="NovaAgent")
-    sessions: dict[str, Session] = {}
-    app.state.sessions = sessions          # exposed for tests/debugging
+
+    # Optional bearer-token auth for every /api endpoint (enable by setting
+    # NOVA_WEB_TOKEN or server.auth_token). The page and static assets stay
+    # public so the browser can load the UI; it then prompts for the token.
+    api_token = os.environ.get("NOVA_WEB_TOKEN") or cfg.get("server.auth_token") or ""
+
+    async def check_auth(request: Request):
+        if not api_token or not request.url.path.startswith("/api"):
+            return
+        if request.headers.get("authorization", "") != f"Bearer {api_token}":
+            raise HTTPException(401, "unauthorized: set Authorization: Bearer <token>")
+
+    app.state.sessions = {}                # exposed for tests/debugging
+    sessions: dict[str, Session] = app.state.sessions
     app.mount("/static", NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        try:
+            await check_auth(request)
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        return await call_next(request)
+
+    @app.on_event("startup")
+    async def janitor() -> None:
+        """Periodically reap expired sessions/runs so long-running servers
+        don't leak memory."""
+        async def _loop():
+            while True:
+                await asyncio.sleep(60)
+                now = time.monotonic()
+                for sid in list(sessions):
+                    s = sessions[sid]
+                    for rid in list(s.runs):
+                        r = s.runs[rid]
+                        if r.done and now - getattr(r, "finished_at", now) > RUN_RETENTION:
+                            del s.runs[rid]
+                            if s.active_run is r:
+                                s.active_run = None
+                    if (not s.running and s.active_run is None
+                            and now - s.last_used > SESSION_IDLE_TTL):
+                        sessions.pop(sid, None)
+                        await s.provider.aclose()
+                while len(sessions) > MAX_SESSIONS:
+                    oldest = min(sessions, key=lambda k: sessions[k].last_used)
+                    s = sessions.pop(oldest)
+                    await s.provider.aclose()
+        asyncio.create_task(_loop())
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -94,7 +147,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     @app.post("/api/sessions")
     async def new_session():
         sid = uuid.uuid4().hex[:12]
-        sessions[sid] = Session(cfg)
+        sessions[sid] = Session(cfg, workspace=workspace)
         return {"session_id": sid,
                 "model": getattr(sessions[sid].provider, "model", "mock"),
                 "server_version": SERVER_VERSION}
@@ -106,6 +159,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             raise HTTPException(404, "unknown session")
         if session.running:
             raise HTTPException(409, "a task is already running in this session")
+        session.last_used = time.monotonic()
 
         run_id = uuid.uuid4().hex[:12]
         run = ChatRun()
