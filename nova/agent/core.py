@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 
 from nova.llm.base import LLMResponse, Message
 from nova.log import JsonlTraceWriter, get_logger
@@ -78,6 +78,9 @@ class Agent:
         self.cost_per_mtok = cost_per_mtok
         self.trace = JsonlTraceWriter(trace_path) if trace_path else None
         self.history: list[Message] = []
+        # Optional async gate for dangerous tools: await approval_callback(name,
+        # args) -> bool before executing a tool marked danger_level="dangerous".
+        self.approval_callback: Callable[[str, dict], Awaitable[bool]] | None = None
 
     def _estimate_cost(self, usage) -> float:
         p, c = self.cost_per_mtok
@@ -181,6 +184,25 @@ class Agent:
             had_error = False
             for tc in msg.tool_calls:
                 t1 = time.monotonic()
+                if self.approval_callback is not None:
+                    tool_obj = self.registry.get(tc.name)
+                    if tool_obj is not None and tool_obj.danger_level == "dangerous":
+                        allowed = await self.approval_callback(tc.name, tc.arguments)
+                        if not allowed:
+                            observation = ("(用户拒绝了本次操作;请说明更安全的替代方案,"
+                                           "或直接基于已有信息继续)")
+                            rec = StepRecord(
+                                step=step_no, kind="act",
+                                tool_name=tc.name, tool_args=tc.arguments,
+                                observation=observation,
+                                duration_s=time.monotonic() - t1,
+                            )
+                            self._emit(rec)
+                            result.steps.append(rec)
+                            self.history.append(Message(
+                                role="tool", content=observation,
+                                tool_call_id=tc.id, name=tc.name))
+                            continue
                 observation = await self.registry.execute(tc)
                 if observation.startswith("ERROR"):
                     had_error = True

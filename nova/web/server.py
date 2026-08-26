@@ -46,6 +46,7 @@ SERVER_VERSION = "v9"   # surfaced via /api/sessions so stale processes are dete
 
 class ChatBody(BaseModel):
     message: str
+    confirm_dangerous: bool = False   # ask the user before dangerous tools run
 
 
 class ChatRun:
@@ -56,6 +57,9 @@ class ChatRun:
         self.done = False
         self.notify = asyncio.Event()
         self.stop_requested = False
+        # pending approval gate (set by the approval_callback in worker)
+        self.approval_event: asyncio.Event | None = None
+        self.approved = False
 
     def emit(self, payload: dict) -> None:
         self.events.append(json.dumps(payload, ensure_ascii=False))
@@ -169,11 +173,23 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
 
         async def worker() -> None:
             agent = session.agent
+            run_started_at = time.monotonic()
             try:
                 agent.stream_callback = lambda d: run.emit(
                     {"type": "delta", "text": d})
                 agent.reasoning_callback = lambda d: run.emit(
                     {"type": "reasoning", "text": d})
+                if body.confirm_dangerous:
+                    async def approve(tool_name: str, args: dict) -> bool:
+                        run.approved = False
+                        run.approval_event = asyncio.Event()
+                        run.emit({"type": "approval_request",
+                                  "tool": tool_name, "args": args})
+                        await run.approval_event.wait()
+                        return run.approved
+                    agent.approval_callback = approve
+                else:
+                    agent.approval_callback = None
 
                 def on_step(step) -> None:
                     run.emit({
@@ -192,6 +208,8 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
                     "steps": result.steps_used,
                     "tokens": result.prompt_tokens + result.completion_tokens,
                     "reason": result.stopped_reason,
+                    "cost_usd": round(result.cost_usd, 4),
+                    "duration_s": round(time.monotonic() - run_started_at, 1),
                 })
             except Exception as exc:
                 run.emit({"type": "error", "message": str(exc)})
@@ -256,6 +274,19 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
         if session.active_run is None:
             return {"ok": True, "note": "nothing running"}
         session.active_run.stop_requested = True
+        return {"ok": True}
+
+    @app.post("/api/approve/{sid}/{rid}")
+    async def approve(sid: str, rid: str, body: dict):
+        """Answer a pending dangerous-tool approval request."""
+        session = sessions.get(sid)
+        if session is None or rid not in session.runs:
+            raise HTTPException(404, "unknown session or run")
+        run = session.runs[rid]
+        if run.approval_event is None or run.approval_event.is_set():
+            raise HTTPException(409, "no pending approval")
+        run.approved = bool(body.get("approved", False))
+        run.approval_event.set()
         return {"ok": True}
 
     @app.delete("/api/sessions/{sid}")

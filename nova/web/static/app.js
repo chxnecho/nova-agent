@@ -1,18 +1,30 @@
-/* ================= NovaAgent web client ================= */
+/* ================= NovaAgent web client (v14-ux) ================= */
 
 const $ = id => document.getElementById(id);
 const chatEl = $("chat"), welcomeEl = $("welcome"), wrapEl = $("chatWrap");
 const input = $("input"), sendBtn = $("sendBtn");
 const pill = $("statusPill"), modelInfo = $("modelInfo"), tokenInfo = $("tokenInfo");
 const convoList = $("convoList"), convTitle = $("convTitle");
-const verInfo = $("verInfo");
-const UI_VERSION = "v13-sec";
+const verInfo = $("verInfo"), runStatusEl = $("runStatus");
+const UI_VERSION = "v14-ux";
 
 let sessionId = null;
 let busy = false;
-let conversations = [];   // [{id, title, ts, messages:[{role, content}]}]
+let conversations = [];   // [{id, title, ts, messages:[{role, content, meta?}]}]
 let serverVersion = "?";
+let lastUserText = "";    // for 重新生成 / 重试
 const STORE_KEY = "nova_convos_v2";
+
+/* ---------------- theme ---------------- */
+
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("nova_theme", t); } catch (e) {}
+  $("themeBtn").textContent = t === "dark" ? "☀️" : "🌙";
+}
+$("themeBtn").onclick = () =>
+  applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+applyTheme(document.documentElement.dataset.theme || "light");
 
 /* ---------------- storage ---------------- */
 
@@ -42,7 +54,7 @@ function recordUserMessage(text) {
   c.messages.push({ role: "user", content: text });
   saveConvos();
 }
-function persistBotMessage(content) {
+function persistBotMessage(content, meta) {
   const c = currentConvo();
   if (!c) return;
   const last = c.messages[c.messages.length - 1];
@@ -50,12 +62,11 @@ function persistBotMessage(content) {
     if (last && last.role === "bot") c.messages.pop();
     saveConvos(); return;
   }
-  if (last && last.role === "bot") last.content = content;
-  else c.messages.push({ role: "bot", content });
+  if (last && last.role === "bot") { last.content = content; if (meta) last.meta = meta; }
+  else c.messages.push({ role: "bot", content, ...(meta ? { meta } : {}) });
   c.ts = Date.now();
   saveConvos();
 }
-
 /* ---------------- mini markdown renderer ---------------- */
 
 function escapeHtml(s) {
@@ -164,8 +175,7 @@ function renderMarkdown(src) {
   }
   return out.join("");
 }
-
-/* ---------------- status & sessions ---------------- */
+/* ---------------- status, auth & sessions ---------------- */
 
 function setStatus(state, text) {
   pill.className = "pill" + (state === "ok" ? "" : " " + state);
@@ -219,13 +229,16 @@ pill.onclick = async () => {
   }
 };
 
-function renderConvoList() {
+function renderConvoList(filter) {
   const label = '<div class="side-label">对话记录</div>';
-  const items = conversations.map(c =>
+  const q = (filter || "").trim().toLowerCase();
+  const shown = q ? conversations.filter(c => c.title.toLowerCase().includes(q))
+                  : conversations;
+  const items = shown.map(c =>
     '<div class="convo' + (c.id === sessionId ? " active" : "") + '" data-id="' + c.id +
     '" title="' + escapeHtml(c.title) + '">' + escapeHtml(c.title) +
     '<button class="del" title="删除">✕</button></div>').join("");
-  convoList.innerHTML = label + (items || "");
+  convoList.innerHTML = label + items;
   convoList.querySelectorAll(".convo").forEach(el => {
     el.onclick = ev => {
       if (ev.target.classList.contains("del")) {
@@ -233,16 +246,19 @@ function renderConvoList() {
         return;
       }
       switchConversation(el.dataset.id);
+      $("sidebar").classList.add("hidden");     // mobile: close drawer
+      $("backdrop").classList.remove("show");
     };
   });
 }
+$("convoSearch").addEventListener("input", e => renderConvoList(e.target.value));
 
 function deleteConversation(id) {
   // local removal + best-effort server-side sync
   apiFetch("/api/sessions/" + id, { method: "DELETE" }).catch(() => {});
   conversations = conversations.filter(c => c.id !== id);
   saveConvos();
-  renderConvoList();
+  renderConvoList($("convoSearch").value);
   if (id === sessionId) newConversation();
 }
 
@@ -255,14 +271,14 @@ function newConversation() {
   chatEl.innerHTML = "";
   convTitle.textContent = "新对话";
   showChat(false);
-  createSession().then(renderConvoList);
+  createSession().then(() => renderConvoList($("convoSearch").value));
   input.focus();
 }
 
 async function switchConversation(id) {
   sessionId = id;
   chatEl.innerHTML = "";
-  renderConvoList();
+  renderConvoList($("convoSearch").value);
   const c = conversations.find(c => c.id === id);
   convTitle.textContent = c ? c.title : "对话";
   showChat(true);
@@ -270,7 +286,8 @@ async function switchConversation(id) {
   // prefer the local copy (instant, survives server restarts)
   if (c && c.messages && c.messages.length) {
     for (const m of c.messages)
-      appendMessage(m.role === "user" ? "user" : "bot", m.content, m.role !== "user");
+      appendMessage(m.role === "user" ? "user" : "bot", m.content,
+                    m.role !== "user", m.meta);
     scrollBottom(true);
     input.focus();
     return;
@@ -292,7 +309,6 @@ async function switchConversation(id) {
   } catch (e) { /* keep empty view */ }
   input.focus();
 }
-
 /* ---------------- message rendering ---------------- */
 
 function nearBottom() {
@@ -302,7 +318,7 @@ function scrollBottom(force) {
   if (force || nearBottom()) wrapEl.scrollTop = wrapEl.scrollHeight;
 }
 
-function appendMessage(role, content, mdRender) {
+function appendMessage(role, content, mdRender, meta) {
   showChat(true);
   const isUser = role === "user";
   const row = document.createElement("div");
@@ -312,6 +328,7 @@ function appendMessage(role, content, mdRender) {
   if (!isUser) {
     bubble.innerHTML = '<div class="steps"></div><div class="md body"></div>';
     setBody(bubble, content || "", mdRender);
+    addBotExtras(bubble, content, meta, false);
   } else {
     bubble.textContent = content || "";
   }
@@ -334,6 +351,38 @@ function setBody(bubble, text, asMarkdown) {
   scrollBottom();
 }
 
+/* meta line + hover action bar under a finished bot message */
+function addBotExtras(bubble, content, meta, allowRegen) {
+  const body = bubble.querySelector(".body");
+  if (!body) return;
+  body.querySelectorAll(".meta,.msg-actions").forEach(e => e.remove());
+  if (meta && meta.duration_s != null) {
+    let html = '<div class="meta">✅ 用时 ' + meta.duration_s + ' 秒 · ' +
+               (meta.steps || "?") + " 步";
+    if (typeof meta.cost_usd === "number") html += " · 约 $" + meta.cost_usd.toFixed(4);
+    html += "</div>";
+    body.insertAdjacentHTML("beforeend", html);
+  }
+  let bar = '<button data-copy title="复制回答">📋 复制</button>';
+  if (allowRegen) bar += '<button data-regen title="重新回答">🔄 重新生成</button>';
+  body.insertAdjacentHTML("beforeend", '<div class="msg-actions">' + bar + "</div>");
+  body.querySelector("[data-copy]").onclick = () => {
+    navigator.clipboard.writeText(content).then(() => setStatus("ok", "已复制 ✓"), () => {});
+  };
+  const regenBtn = body.querySelector("[data-regen]");
+  if (regenBtn) regenBtn.onclick = () => { if (!busy && lastUserText) sendMessage(lastUserText); };
+}
+
+/* human-friendly error mapping for non-technical users */
+function humanizeError(raw) {
+  const s = String(raw || "");
+  if (/401|unauthorized|令牌/i.test(s)) return "访问令牌不正确或已失效,请刷新页面重新输入。";
+  if (/api.?key|authentication|invalid.*key/i.test(s)) return "API 密钥无效或未配置,请联系服务管理员检查配置。";
+  if (/quota|insufficient|429|rate.?limit|too many/i.test(s)) return "请求太频繁或模型额度不足,请稍等几秒再试。";
+  if (/timeout|timed out/i.test(s)) return "响应超时了,模型可能正忙,请点击重试。";
+  if (/network|connect|fetch|failed/i.test(s)) return "网络连接失败,请确认服务正在运行后重试。";
+  return "出了点小问题:" + s.slice(0, 200);
+}
 /* ---------------- chat streaming ---------------- */
 
 function setBusyUI(b) {
@@ -343,14 +392,63 @@ function setBusyUI(b) {
   sendBtn.title = b ? "停止生成" : "发送";
 }
 
-async function sendMessage() {
+/* friendly progress strip: "🔧 正在查看文件 · 第 2 步 · 已用 8 秒" */
+const TOOL_LABELS = {
+  run_shell: "执行命令", python_repl: "运行 Python 代码", read_file: "查看文件",
+  write_file: "写入文件", edit_file: "修改文件", list_dir: "浏览目录",
+  web_fetch: "访问网页", remember: "保存记忆", recall: "回忆信息",
+  ingest_document: "索引文档", search_knowledge: "搜索知识库",
+};
+let phaseBase = "", phaseTimer = null, runStart = 0;
+function setPhase(kind, toolName, stepNo) {
+  if (kind === "thinking") phaseBase = "🤔 正在思考";
+  else if (kind === "tool") phaseBase = "🔧 正在" +
+    (TOOL_LABELS[toolName] || ("调用 " + toolName)) +
+    (stepNo ? " · 第 " + stepNo + " 步" : "");
+  else if (kind === "writing") phaseBase = "✍️ 正在撰写回答";
+  else if (kind === "wait") phaseBase = "⏸ 等待你的确认";
+  runStatusEl.textContent = phaseBase;
+}
+function startPhases() {
+  runStart = Date.now();
+  setPhase("thinking");
+  runStatusEl.style.display = "block";
+  clearInterval(phaseTimer);
+  phaseTimer = setInterval(() => {
+    const s = Math.round((Date.now() - runStart) / 1000);
+    runStatusEl.textContent = phaseBase + " · 已用 " + s + " 秒";
+  }, 500);
+}
+function stopPhases() { clearInterval(phaseTimer); runStatusEl.style.display = "none"; }
+
+/* subtle completion nudge when the tab is in the background */
+function notifyDone() {
+  if (!document.hidden) return;
+  document.title = "✅ 任务完成 — NovaAgent";
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.connect(g); g.connect(ctx.destination);
+    o.frequency.setValueAtTime(880, ctx.currentTime);
+    o.frequency.setValueAtTime(660, ctx.currentTime + .13);
+    g.gain.value = .06;
+    o.start(); o.stop(ctx.currentTime + .28);
+  } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) document.title = "NovaAgent";
+});
+
+async function sendMessage(forcedText) {
   if (busy) {                       // acting as STOP button
     requestStop();
     return;
   }
-  const text = input.value.trim();
+  const text = (forcedText != null ? forcedText : input.value).trim();
   if (!text || !sessionId) return;
-  input.value = ""; autoGrow();
+  if (forcedText == null) { input.value = ""; }
+  lastUserText = text;
+  autoGrow();
   setBusyUI(true);
 
   appendMessage("user", text);
@@ -360,10 +458,11 @@ async function sendMessage() {
   // animated hint shown while the model is silently thinking
   const waitingEl = document.createElement("div");
   waitingEl.className = "waiting";
-  waitingEl.textContent = "⏳ 正在思考与执行,请稍候…";
+  waitingEl.textContent = "🤔 正在思考,请稍候…";
   chatEl.appendChild(waitingEl);
   scrollBottom(true);
   const clearWaiting = () => waitingEl.remove();
+  startPhases();
 
   const bubble = appendMessage("bot", "");
   const stepsEl = bubble.querySelector(".steps");
@@ -380,7 +479,7 @@ async function sendMessage() {
 
   // single exit point: unlocks UI exactly once
   let finished = false;
-  function finish(note, color) {
+  function finish(note, color, meta) {
     if (finished) return;
     finished = true;
     if (note) {
@@ -389,9 +488,12 @@ async function sendMessage() {
     }
     const liveR = stepsEl.querySelector("details.reasoning[open]");
     if (liveR) liveR.open = false;           // collapse thinking panel
+    stepsEl.querySelectorAll(".approve-card:not(.done) button").forEach(b => b.disabled = true);
     bodyEl().classList.remove("cursor");
     clearWaiting();
-    persistBotMessage(acc);                  // auto-save the final answer locally
+    stopPhases();
+    persistBotMessage(acc, meta);            // auto-save the final answer locally
+    addBotExtras(bubble, acc, meta, true);   // meta line + 复制 / 重新生成
     apiFetch("/api/stats/" + sessionId).then(r => r.json()).then(s => {
       tokenInfo.textContent = "tokens: " + s.total_tokens;
       modelInfo.textContent = "model: " + s.model;
@@ -399,17 +501,16 @@ async function sendMessage() {
     setBusyUI(false);
     scrollBottom();
     input.focus();
+    notifyDone();
   }
 
   // ---- step 1: start the run ---- //
-  // Compatible with both backends:
-  //   new server -> JSON {"run_id"} then poll /api/events/{sid}/{rid}
-  //   old server -> the POST itself returns the SSE event stream
   let resp;
   const postChat = () => apiFetch("/api/chat/" + sessionId, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message: text }),
+    body: JSON.stringify({ message: text,
+                           confirm_dangerous: getConfirmMode() }),
   });
   try {
     resp = await postChat();
@@ -418,14 +519,22 @@ async function sendMessage() {
       resp = await postChat();
     }
   } catch (e) {
-    finish("❌ 连接失败: " + escapeHtml(String(e)), "var(--red)");
+    finish("❌ " + humanizeError(e) +
+           ' <button class="retry" style="border:none;background:none;color:var(--accent);cursor:pointer;font-size:12.5px">🔄 重试</button>',
+           "var(--red)");
+    wireRetry(bubble);
     return;
   }
   if (resp.status === 409) {
     finish("⚠️ 上一个任务仍在运行,请先停止或等待完成", "var(--orange)");
     return;
   }
-  if (!resp.ok) { finish("❌ HTTP " + resp.status, "var(--red)"); return; }
+  if (!resp.ok) { finish("❌ " + humanizeError("HTTP " + resp.status), "var(--red)"); return; }
+
+  function wireRetry(b) {
+    const btn = b.querySelector(".retry");
+    if (btn) btn.onclick = () => { if (!busy && lastUserText) sendMessage(lastUserText); };
+  }
 
   const ctype = (resp.headers.get("content-type") || "").split(";")[0].trim();
 
@@ -444,7 +553,7 @@ async function sendMessage() {
         for (const part of parts) {
           if (!part.startsWith("data: ")) continue;
           let d; try { d = JSON.parse(part.slice(6)); } catch (e) { continue; }
-          try { handleEvent(d); }                 // 同样加保护
+          try { handleEvent(d); }
           catch (err) { console.error("handleEvent error:", err); }
           if (finished) return;
         }
@@ -452,7 +561,7 @@ async function sendMessage() {
       persistBotMessage(acc);
       finish();
     } catch (e) {
-      finish("❌ 连接中断: " + escapeHtml(String(e)), "var(--red)");
+      finish("❌ " + humanizeError(String(e)), "var(--red)");
     }
   };
 
@@ -474,8 +583,6 @@ async function sendMessage() {
 
   let idx = 0;
   let fails = 0;
-  // Plain request/response polling: works identically in every browser and
-  // through every proxy, no streaming support required.
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   const pollLoop = async () => {
@@ -489,8 +596,7 @@ async function sendMessage() {
       } catch (e) {
         fails++;
         if (fails >= 12) {          // ~10s of consecutive failures → give up cleanly
-          finish("❌ 无法获取事件(" + escapeHtml(String(e.message || e)) +
-                 "),请确认 nova serve 正在运行", "var(--red)");
+          finish("❌ 无法获取任务进度,请确认服务正在运行后重试", "var(--red)");
           return;
         }
         await sleep(800);
@@ -520,15 +626,19 @@ async function sendMessage() {
     return det;
   };
 
+  let pendingMeta = null;
+
   function handleEvent(d) {
     if (d.type === "delta") {
       acc += d.text;
       queueRender();
+      setPhase("writing");
     } else if (d.type === "reasoning") {
       reasonText += d.text;
       const det = ensurePanel();
       det.querySelector(".rbody").textContent = reasonText.slice(-2000);
       det.querySelector(".rbody").scrollTop = 1e6;
+      setPhase("thinking");
       scrollBottom();
     } else if (d.type === "step") {
       if (d.kind !== "act") return;           // think/final stay out of the panel
@@ -541,21 +651,50 @@ async function sendMessage() {
         escapeHtml((d.observation || "").slice(0, 400)) + "</div>");
       det.querySelector(".rtlist").scrollTop = 1e6;
       det.open = true;                        // keep live progress visible
+      setPhase("tool", d.tool, d.step);
       scrollBottom();
-          acc = d.text || acc;
-          setBody(bubble, acc, true);
-          if (d.reason === "user_stopped")
-            finish("⏹ 已按你的要求停止", "var(--dim)");
-          else if (d.reason && d.reason !== "completed")
-            finish("⚠️ 提前停止: " + escapeHtml(d.reason), "var(--orange)");
-        } else if (d.type === "error") {
-          stepsEl.insertAdjacentHTML("beforeend",
-            '<div class="step" style="border-left-color:var(--red)">❌ ' +
-            escapeHtml(d.message) + "</div>");
-          scrollBottom();
-        } else if (d.type === "done") {
-          finish();                         // all events delivered
-        }
+    } else if (d.type === "approval_request") {
+      // inline consent card for dangerous tools (novice-friendly safety gate)
+      const label = TOOL_LABELS[d.tool] || d.tool;
+      const argSummary = Object.entries(d.args || {})
+        .map(([k, v]) => k + ": " + String(v).slice(0, 300)).join("\n");
+      stepsEl.insertAdjacentHTML("beforeend",
+        '<div class="approve-card"><div class="at">⚠️ NovaAgent 想要「' +
+        escapeHtml(label) + '」,需要你的确认</div>' +
+        '<div class="ac">' + escapeHtml(argSummary) + "</div>" +
+        '<div class="abtns"><button class="ok">✓ 允许执行</button>' +
+        '<button class="no">✕ 跳过这步</button></div></div>');
+      const card = stepsEl.lastElementChild;
+      card.querySelectorAll(".abtns button").forEach(btn => {
+        btn.onclick = async () => {
+          if (card.classList.contains("done")) return;
+          card.classList.add("done");
+          card.querySelectorAll("button").forEach(b => b.disabled = true);
+          const yes = btn.classList.contains("ok");
+          card.querySelector(".abtns").insertAdjacentHTML("afterend",
+            '<div class="verdict">' + (yes ? "✓ 已允许执行" : "✕ 已跳过这一步") + "</div>");
+          try {
+            await apiFetch(`/api/approve/${sessionId}/${runId}`, {
+              method: "POST", body: JSON.stringify({ approved: yes }) });
+          } catch (e) { console.error("approve failed:", e); }
+        };
+      });
+      setPhase("wait");
+      scrollBottom(true);
+    } else if (d.type === "final") {
+      acc = d.text || acc;                    // authoritative answer text
+      setBody(bubble, acc, true);
+      pendingMeta = { steps: d.steps, tokens: d.tokens,
+                      cost_usd: d.cost_usd, duration_s: d.duration_s };
+      if (d.reason === "user_stopped")
+        finish("⏹ 已按你的要求停止", "var(--dim)", pendingMeta);
+      else if (d.reason && d.reason !== "completed")
+        finish("⚠️ 提前停止: " + escapeHtml(d.reason), "var(--orange)", pendingMeta);
+    } else if (d.type === "error") {
+      finish("❌ " + humanizeError(d.message), "var(--red)");
+    } else if (d.type === "done") {
+      finish(undefined, undefined, pendingMeta);   // all events delivered
+    }
   }
 
   pollLoop();
@@ -574,20 +713,39 @@ function autoGrow() {
   input.style.height = Math.min(input.scrollHeight, 180) + "px";
 }
 
-sendBtn.onclick = sendMessage;
+/* confirmation mode: ask before dangerous tools execute (default on) */
+function getConfirmMode() {
+  try { return localStorage.getItem("nova_confirm") !== "0"; } catch (e) { return true; }
+}
+const confirmToggle = $("confirmToggle");
+confirmToggle.checked = getConfirmMode();
+confirmToggle.onchange = () => {
+  try { localStorage.setItem("nova_confirm", confirmToggle.checked ? "1" : "0"); }
+  catch (e) {}
+};
+
+sendBtn.onclick = () => sendMessage();
 input.addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 input.addEventListener("input", autoGrow);
 $("newChat").onclick = newConversation;
-$("menuBtn").onclick = () => $("sidebar").classList.toggle("hidden");
+$("menuBtn").onclick = () => {
+  const sb = $("sidebar");
+  sb.classList.toggle("hidden");
+  $("backdrop").classList.toggle("show", !sb.classList.contains("hidden"));
+};
+$("backdrop").onclick = () => {
+  $("sidebar").classList.add("hidden");
+  $("backdrop").classList.remove("show");
+};
 document.querySelectorAll(".card").forEach(c =>
-  c.addEventListener("click", () => { input.value = c.dataset.prompt; autoGrow(); input.focus(); }));
+  c.addEventListener("click", () => sendMessage(c.dataset.prompt)));   // 一键体验
 
 loadConvos();
 if (window.innerWidth < 860) $("sidebar").classList.add("hidden");   // mobile: collapsed
 (async function init() {
   const ok = await createSession();
-  renderConvoList();
+  renderConvoList($("convoSearch").value);
   if (ok && conversations.length) showChat(false);
 })();
