@@ -381,7 +381,7 @@ function humanizeError(raw) {
   if (/quota|insufficient|429|rate.?limit|too many/i.test(s)) return "请求太频繁或模型额度不足,请稍等几秒再试。";
   if (/timeout|timed out/i.test(s)) return "响应超时了,模型可能正忙,请点击重试。";
   if (/network|connect|fetch|failed/i.test(s)) return "网络连接失败,请确认服务正在运行后重试。";
-  return "出了点小问题:" + s.slice(0, 200);
+  return "出了点小问题:" + escapeHtml(s.slice(0, 200));
 }
 /* ---------------- chat streaming ---------------- */
 

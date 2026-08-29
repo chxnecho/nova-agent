@@ -118,6 +118,46 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
             return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
         return await call_next(request)
 
+    # ---- coarse per-IP rate limit for the /api surface (in-process) ----
+    # Cheap token bucket refreshes every 60s; guards against open abuse when a
+    # token is unset / brute-force of the bearer token when it is set.
+    RATE_LIMIT_PER_MIN = int(cfg.get("server.rate_limit_per_minute", 300))
+    app.state.rate_buckets: dict[str, list] = {}
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        if request.url.path.startswith("/api"):
+            ip = request.client.host if request.client else "unknown"
+            buckets = app.state.rate_buckets
+            now = time.monotonic()
+            bucket = buckets.get(ip)
+            if bucket is None or now - bucket[1] >= 60:
+                bucket = [float(RATE_LIMIT_PER_MIN), now]
+                buckets[ip] = bucket
+            if bucket[0] <= 0:
+                return JSONResponse({"detail": "rate limit exceeded"},
+                                    status_code=429)
+            bucket[0] -= 1
+            if len(buckets) > 4096:          # bound memory
+                buckets.pop(next(iter(buckets)), None)
+        return await call_next(request)
+
+    # ---- basic security headers (defense-in-depth for the client) ----
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        resp = await call_next(request)
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        resp.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "font-src 'self'; connect-src 'self'; "
+            "base-uri 'self'; form-action 'self'",
+        )
+        return resp
+
     @app.on_event("startup")
     async def janitor() -> None:
         """Periodically reap expired sessions/runs so long-running servers
@@ -219,8 +259,6 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
                     session.active_run = None
                 run.mark_done()
 
-        run.task = asyncio.create_task(worker())
-        return {"run_id": run_id}
         run.task = asyncio.create_task(worker())
         return {"run_id": run_id}
 

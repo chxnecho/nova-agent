@@ -140,3 +140,24 @@ async def test_agent_cooperative_stop_between_steps(tmp_path):
 
     assert result.stopped_reason == "user_stopped"
     assert "停止" in result.final_answer
+
+
+async def test_agent_max_consecutive_errors(tmp_path):
+    """The consecutive-error guard stops a run that keeps failing tools."""
+    @tool(name="boom", description="always fails",
+          parameters={"type": "object", "properties": {}})
+    async def boom() -> str:
+        raise ValueError("kaput")
+
+    mock = MockProvider()
+    mock.enqueue(resp_tool_call("boom", "{}"),
+                 resp_tool_call("boom", "{}"),
+                 resp_text("should never run"))
+    reg = ToolRegistry()
+    reg.register(boom)
+
+    agent = Agent(mock, reg, workspace=tmp_path,
+                  reflect_on_error=False, max_consecutive_errors=2)
+    result = await agent.run("keep failing")
+    assert result.stopped_reason == "max_errors"
+    assert "2 times in a row" in result.final_answer

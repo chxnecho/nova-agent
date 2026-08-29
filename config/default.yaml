@@ -15,6 +15,7 @@ agent:
   max_steps: 40                 # hard cap on think-act iterations per run
   max_cost_usd: 2.0             # budget guard per run
   reflect_on_error: true        # enable self-reflection after tool failures
+  max_consecutive_errors: 0     # stop after this many tools fail in a row (0 = off)
   system_prompt_file: null      # optional path to a custom system prompt
 
 memory:
@@ -38,10 +39,13 @@ tools:
   web:
     enabled: true
     timeout_seconds: 30
+    allow_private: false          # SSRF guard: refuse internal/loopback/link-local hosts
+    allowed_domains: null         # optional hostname allow-list (comma-separated string)
 
 server:
   host: 127.0.0.1
   port: 8321
+  rate_limit_per_minute: 300      # per-IP cap for every /api/* request (0 disables)
 
 logging:
   level: INFO

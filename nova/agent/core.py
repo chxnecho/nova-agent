@@ -57,6 +57,7 @@ class Agent:
         max_steps: int = 40,
         max_cost_usd: float = 2.0,
         reflect_on_error: bool = True,
+        max_consecutive_errors: int | None = None,
         trace_path: Path | None = None,
         on_step: StepCallback | None = None,
         stream_callback: Callable[[str], None] | None = None,
@@ -72,6 +73,7 @@ class Agent:
         self.max_steps = max_steps
         self.max_cost_usd = max_cost_usd
         self.reflect_on_error = reflect_on_error
+        self.max_consecutive_errors = max_consecutive_errors
         self.on_step = on_step or (lambda s: None)
         self.stream_callback = stream_callback
         self.reasoning_callback = reasoning_callback
@@ -227,7 +229,20 @@ class Agent:
             # ---- reflect after failures ---- #
             if had_error and self.reflect_on_error:
                 self.history.append(Message(role="system", content=REFLECTION_PROMPT))
-                consecutive_errors = 0  # one fresh chance per reflection
+
+            # ---- guard: stop after too many consecutive tool failures ---- #
+            if self.max_consecutive_errors:
+                if consecutive_errors >= self.max_consecutive_errors:
+                    result.stopped_reason = "max_errors"
+                    result.final_answer = (
+                        f"Stopped: failed {consecutive_errors} times in a row "
+                        f"(limit {self.max_consecutive_errors}). Last error: "
+                        + (self.history[-1].content or "")[:500]
+                    )
+                    return result
+            elif had_error:
+                # legacy behavior: one fresh chance after each reflected failure
+                consecutive_errors = 0
 
             # ---- cooperative stop between steps ---- #
             if should_stop is not None and should_stop():
@@ -260,11 +275,17 @@ def build_default_agent(cfg, provider, workspace: str | Path = ".") -> Agent:
     registry = ToolRegistry()
     FilesystemTools(workspace).register(registry)
     if cfg.get("tools.shell.enabled", True):
-        ShellTool(str(workspace), int(cfg.get("tools.shell.timeout_seconds", 60))).register(registry)
+        ShellTool(str(workspace), int(cfg.get("tools.shell.timeout_seconds", 60)),
+                  workspace_root=str(workspace)).register(registry)
     if cfg.get("tools.python_repl.enabled", True):
         PythonReplTool(str(workspace), int(cfg.get("tools.python_repl.timeout_seconds", 30))).register(registry)
     if cfg.get("tools.web.enabled", True):
-        WebTools().register(registry)
+        allow_private = bool(cfg.get("tools.web.allow_private", False))
+        domains = cfg.get("tools.web.allowed_domains")
+        if isinstance(domains, str):
+            domains = [d.strip() for d in domains.split(",") if d.strip()]
+        WebTools(allow_private=allow_private,
+                 allowed_domains=domains or None).register(registry)
 
     memory_system_prompt = ""
     if cfg.get("memory.enabled", True):
@@ -293,6 +314,7 @@ def build_default_agent(cfg, provider, workspace: str | Path = ".") -> Agent:
         max_steps=int(cfg.get("agent.max_steps", 40)),
         max_cost_usd=float(cfg.get("agent.max_cost_usd", 2.0)),
         reflect_on_error=bool(cfg.get("agent.reflect_on_error", True)),
+        max_consecutive_errors=cfg.get("agent.max_consecutive_errors"),
         trace_path=trace_path,
         system_extra=memory_system_prompt or None,
     )
