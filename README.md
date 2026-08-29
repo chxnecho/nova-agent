@@ -17,10 +17,16 @@
 ## 快速开始
 
 ```bash
+# 方式一:uv(推荐)——一条命令创建 .venv 并安装 server+dev 全部依赖
+uv sync
+cp .env.example .env              # 填入你的 OPENROUTER_API_KEY
+
+# 方式二:传统 pip
 python3 -m venv .venv
 .venv/bin/pip install -e ".[server,dev]"
-cp .env.example .env          # 填入你的 OPENROUTER_API_KEY
 ```
+
+> 依赖已锁定在 `uv.lock`(提交到仓库),`uv sync` 可复现完全一致的环境。
 
 配置在 `config/default.yaml`,可用 `NOVA_` 前缀环境变量覆盖(嵌套键用 `__` 连接),
 例如 `NOVA_LLM__MODEL=qwen/qwen3-235b-a22b`。

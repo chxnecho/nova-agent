@@ -6,10 +6,21 @@ requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
     "pyyaml>=6.0",
-    "socksio>=2.0",
+    "socksio>=1.0",
 ]
 
 [project.optional-dependencies]
+server = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+# PEP 735 dependency-groups,供 `uv sync` 使用(与上方 extras 内容一致,保持同步)
+[dependency-groups]
 server = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
@@ -32,3 +43,9 @@ include = ["nova*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.uv]
+# 使 `uv sync` 默认安装 server 与 dev 全部依赖（等价于 pip install -e ".[server,dev]"）
+default-groups = ["server", "dev"]
+# 缓存放到数据盘,避免与 /home 跨文件系统导致 hardlink 退化为 copy
+cache-dir = "/data/.uv-cache"
