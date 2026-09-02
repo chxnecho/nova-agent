@@ -1,28 +1,42 @@
 import json
 
-from nova.agent.core import Agent, StepRecord
+from nova.agent.core import Agent
 from nova.llm.base import LLMResponse, Message, ToolCall, Usage
 from nova.llm.mock import MockProvider
 from nova.tools.base import ToolRegistry, tool
 
 
 def resp_text(text):
-    return LLMResponse(message=Message(role="assistant", content=text),
-                       usage=Usage(10, 5), model="mock", finish_reason="stop")
+    return LLMResponse(
+        message=Message(role="assistant", content=text),
+        usage=Usage(10, 5),
+        model="mock",
+        finish_reason="stop",
+    )
 
 
 def resp_tool_call(name, args_json):
     return LLMResponse(
-        message=Message(role="assistant", content=None,
-                        tool_calls=[ToolCall(id="tc1", name=name,
-                                             arguments=json.loads(args_json))]),
-        usage=Usage(20, 10), model="mock", finish_reason="tool_calls")
+        message=Message(
+            role="assistant",
+            content=None,
+            tool_calls=[ToolCall(id="tc1", name=name, arguments=json.loads(args_json))],
+        ),
+        usage=Usage(20, 10),
+        model="mock",
+        finish_reason="tool_calls",
+    )
 
 
-@tool(name="add", description="add two ints",
-      parameters={"type": "object",
-                  "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-                  "required": ["a", "b"]})
+@tool(
+    name="add",
+    description="add two ints",
+    parameters={
+        "type": "object",
+        "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+        "required": ["a", "b"],
+    },
+)
 async def add(a: int, b: int) -> str:
     return str(a + b)
 
@@ -37,9 +51,13 @@ async def test_agent_full_loop(tmp_path):
     reg.register(add)
 
     seen_steps = []
-    agent = Agent(mock, reg, workspace=tmp_path,
-                  trace_path=tmp_path / "trace.jsonl",
-                  on_step=seen_steps.append)
+    agent = Agent(
+        mock,
+        reg,
+        workspace=tmp_path,
+        trace_path=tmp_path / "trace.jsonl",
+        on_step=seen_steps.append,
+    )
     result = await agent.run("compute 2+3")
 
     assert result.final_answer == "The answer is 5."
@@ -51,13 +69,12 @@ async def test_agent_full_loop(tmp_path):
     assert "tool" in roles
     # trace file written
     lines = (tmp_path / "trace.jsonl").read_text().strip().splitlines()
-    events = [json.loads(l) for l in lines]
+    events = [json.loads(line) for line in lines]
     assert any(e["kind"] == "act" and e["observation"] == "5" for e in events)
 
 
 async def test_agent_reflection_on_error(tmp_path):
-    @tool(name="boom", description="always fails",
-          parameters={"type": "object", "properties": {}})
+    @tool(name="boom", description="always fails", parameters={"type": "object", "properties": {}})
     async def boom() -> str:
         raise ValueError("kaput")
 
@@ -133,7 +150,7 @@ async def test_agent_cooperative_stop_between_steps(tmp_path):
 
     def stop_after_first_step():
         calls["n"] += 1
-        return calls["n"] > 1   # False during first check, True after tools ran
+        return calls["n"] > 1  # False during first check, True after tools ran
 
     agent = Agent(mock, reg, workspace=tmp_path)
     result = await agent.run("loop", should_stop=stop_after_first_step)
@@ -144,20 +161,51 @@ async def test_agent_cooperative_stop_between_steps(tmp_path):
 
 async def test_agent_max_consecutive_errors(tmp_path):
     """The consecutive-error guard stops a run that keeps failing tools."""
-    @tool(name="boom", description="always fails",
-          parameters={"type": "object", "properties": {}})
+
+    @tool(name="boom", description="always fails", parameters={"type": "object", "properties": {}})
     async def boom() -> str:
         raise ValueError("kaput")
 
     mock = MockProvider()
-    mock.enqueue(resp_tool_call("boom", "{}"),
-                 resp_tool_call("boom", "{}"),
-                 resp_text("should never run"))
+    mock.enqueue(
+        resp_tool_call("boom", "{}"), resp_tool_call("boom", "{}"), resp_text("should never run")
+    )
     reg = ToolRegistry()
     reg.register(boom)
 
-    agent = Agent(mock, reg, workspace=tmp_path,
-                  reflect_on_error=False, max_consecutive_errors=2)
+    agent = Agent(mock, reg, workspace=tmp_path, reflect_on_error=False, max_consecutive_errors=2)
     result = await agent.run("keep failing")
     assert result.stopped_reason == "max_errors"
     assert "2 times in a row" in result.final_answer
+
+
+async def test_agent_history_compression(tmp_path):
+    """Configured summarize_threshold folds old messages into an LLM summary."""
+
+    @tool(
+        name="add",
+        description="add two ints",
+        parameters={
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+            "required": ["a", "b"],
+        },
+    )
+    async def add(a: int, b: int) -> str:
+        return str(a + b)
+
+    mock = MockProvider()
+    mock.enqueue(
+        resp_tool_call("add", '{"a": 1, "b": 2}'),  # step1: act
+        resp_text("SUMMARY"),  # step2: summarization call
+        resp_text("final done"),  # step2: main call
+    )
+    reg = ToolRegistry()
+    reg.register(add)
+
+    agent = Agent(mock, reg, workspace=tmp_path, summarize_threshold=2, context_window_messages=2)
+    result = await agent.run("xyz")
+    assert result.final_answer == "final done"
+    # the oldest (user) message got folded into a summary system message
+    assert any("Prior context (summarized)" in (m.content or "") for m in agent.history)
+    assert not any(m.role == "user" for m in agent.history)

@@ -88,8 +88,10 @@ class Config:
 
     def __repr__(self) -> str:  # pragma: no cover
         # never dump secrets
-        safe = {k: ("***" if "key" in k.lower() or "token" in k.lower() else v)
-                for k, v in self._data.items()}
+        safe = {
+            k: ("***" if "key" in k.lower() or "token" in k.lower() else v)
+            for k, v in self._data.items()
+        }
         return f"Config({safe!r})"
 
 
@@ -104,7 +106,7 @@ def load_config(config_path: Path | None = None) -> Config:
     for key, value in os.environ.items():
         if not key.startswith(ENV_PREFIX):
             continue
-        dotted = key[len(ENV_PREFIX):]
+        dotted = key[len(ENV_PREFIX) :]
         if "__" not in dotted:
             # top-level simple vars like NOVA_LLM_PROVIDER map to known sections
             section_map = {

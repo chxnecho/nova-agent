@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+from itertools import pairwise
 
 
 class HashEmbedder:
@@ -39,15 +40,13 @@ class HashEmbedder:
         vec = [0.0] * self.dim
         tokens = self.tokenize(text)
 
-        features: list[tuple[str, float]] = []
-        for t in tokens:
-            features.append((f"u:{t}", 1.0))
-        for a, b in zip(tokens, tokens[1:]):
+        features: list[tuple[str, float]] = [(f"u:{t}", 1.0) for t in tokens]
+        for a, b in pairwise(tokens):
             features.append((f"b:{a}|{b}", 0.6))
 
         # CJK char bigrams (tokens list already splits CJK into chars)
         cjk = [t for t in tokens if "\u4e00" <= t <= "\u9fff"]
-        for a, b in zip(cjk, cjk[1:]):
+        for a, b in pairwise(cjk):
             features.append((f"c:{a}{b}", 0.8))
 
         for f, w in features:
@@ -64,7 +63,7 @@ class HashEmbedder:
 
 
 def cosine(a: list[float], b: list[float]) -> float:
-    num = sum(x * y for x, y in zip(a, b))
+    num = sum(x * y for x, y in zip(a, b, strict=True))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
     if na == 0 or nb == 0:

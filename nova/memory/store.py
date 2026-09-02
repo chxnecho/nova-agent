@@ -45,7 +45,7 @@ def chunk_text(text: str, max_chars: int = 800, overlap: int = 120) -> list[str]
                 chunks.append(buf)
                 buf = ""
             chunks.append(para[:max_chars])
-            para = para[max_chars - overlap:]
+            para = para[max_chars - overlap :]
         if not buf:
             buf = para
         elif len(buf) + len(para) + 2 <= max_chars:
@@ -76,14 +76,17 @@ class MemoryStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder or HashEmbedder(512)
-        self._lock = threading.Lock()
-        with self._conn() as c:
-            c.executescript(_SCHEMA)
+        # One persistent connection reused across calls (thread-safe via the
+        # lock below) instead of opening/closing a new sqlite handle per call.
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock, self._conn:
+            self._conn.executescript(_SCHEMA)
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _acquire(self) -> sqlite3.Connection:
+        """Context-style helper: returns the shared connection under the lock."""
+        return self._conn
 
     # ------------------------------------------------------------------ #
 
@@ -92,7 +95,7 @@ class MemoryStore:
         if not text:
             raise ValueError("cannot store empty memory")
         emb = self.embedder.embed(text)
-        with self._lock, self._conn() as c:
+        with self._lock, self._acquire() as c:
             cur = c.execute(
                 "INSERT INTO memories (text, kind, source, created_at, dim, embedding) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -113,24 +116,30 @@ class MemoryStore:
         sql = "SELECT * FROM memories" + (" WHERE kind = ?" if kind else "")
         params = (kind,) if kind else ()
         scored: list[MemoryRecord] = []
-        with self._lock, self._conn() as c:
+        with self._lock, self._acquire() as c:
             for row in c.execute(sql, params):
                 emb = json.loads(row["embedding"])
                 score = cosine(qemb, emb)
-                scored.append(MemoryRecord(
-                    id=row["id"], text=row["text"], kind=row["kind"],
-                    source=row["source"], created_at=row["created_at"], score=score,
-                ))
+                scored.append(
+                    MemoryRecord(
+                        id=row["id"],
+                        text=row["text"],
+                        kind=row["kind"],
+                        source=row["source"],
+                        created_at=row["created_at"],
+                        score=score,
+                    )
+                )
         scored.sort(key=lambda r: r.score, reverse=True)
         return scored[:top_k]
 
     def delete(self, memory_id: int) -> bool:
-        with self._lock, self._conn() as c:
+        with self._lock, self._acquire() as c:
             cur = c.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
             return cur.rowcount > 0
 
     def count(self, kind: str | None = None) -> int:
         sql = "SELECT COUNT(*) AS n FROM memories" + (" WHERE kind = ?" if kind else "")
         params = (kind,) if kind else ()
-        with self._conn() as c:
+        with self._lock, self._acquire() as c:
             return int(c.execute(sql, params).fetchone()["n"])

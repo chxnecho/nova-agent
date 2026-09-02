@@ -21,13 +21,15 @@ class MemoryTools:
             tool(
                 name="remember",
                 description="Persist an important fact, decision or lesson to long-term "
-                            "memory so you (or a future session) can recall it later.",
+                "memory so you (or a future session) can recall it later.",
                 parameters={
                     "type": "object",
                     "properties": {
                         "note": {"type": "string", "description": "The fact to remember"},
-                        "kind": {"type": "string",
-                                 "description": "Category: note | fact | decision | lesson"},
+                        "kind": {
+                            "type": "string",
+                            "description": "Category: note | fact | decision | lesson",
+                        },
                     },
                     "required": ["note"],
                 },
@@ -35,7 +37,7 @@ class MemoryTools:
             tool(
                 name="recall",
                 description="Search long-term memory for previously stored notes/facts "
-                            "relevant to a query. Returns the most similar entries.",
+                "relevant to a query. Returns the most similar entries.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -48,7 +50,7 @@ class MemoryTools:
             tool(
                 name="ingest_document",
                 description="Read a text/markdown/code file in the workspace, chunk it and "
-                            "index it into long-term memory for later semantic search.",
+                "index it into long-term memory for later semantic search.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -60,7 +62,7 @@ class MemoryTools:
             tool(
                 name="search_knowledge",
                 description="Semantic search over all ingested documents in memory. "
-                            "Use to answer questions grounded in previously indexed files.",
+                "Use to answer questions grounded in previously indexed files.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -82,8 +84,7 @@ class MemoryTools:
         records = self.store.search(query, top_k=top_k or 5)
         if not records:
             return "(no memories found)"
-        lines = [f"[{r.id}] (score={r.score:.3f}, kind={r.kind}) {r.text[:400]}"
-                 for r in records]
+        lines = [f"[{r.id}] (score={r.score:.3f}, kind={r.kind}) {r.text[:400]}" for r in records]
         return "\n---\n".join(lines)
 
     async def ingest_document(self, path: str) -> str:

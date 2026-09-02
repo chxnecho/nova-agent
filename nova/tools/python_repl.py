@@ -28,36 +28,39 @@ class PythonReplTool:
         self.timeout = timeout_seconds
 
     def register(self, registry) -> None:
-        registry.register(tool(
-            name="python_repl",
-            description="Run Python code in an isolated interpreter and get stdout/stderr. "
-                        "Use `print()` to see results. The last expression's value is NOT "
-                        "shown automatically. For long-running or blocking work prefer run_shell.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "Python source code to execute"},
+        registry.register(
+            tool(
+                name="python_repl",
+                description="Run Python code in an isolated interpreter and get stdout/stderr. "
+                "Use `print()` to see results. The last expression's value is NOT "
+                "shown automatically. For long-running or blocking work prefer run_shell.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "Python source code to execute"},
+                    },
+                    "required": ["code"],
                 },
-                "required": ["code"],
-            },
-            danger_level="dangerous",
-        )(self.run_code))
+                danger_level="dangerous",
+            )(self.run_code)
+        )
 
     async def run_code(self, code: str) -> str:
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
-                                         encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as f:
             f.write(_BOOTSTRAP + "\n" + code)
             path = f.name
         try:
             proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-u", path,
+                sys.executable,
+                "-u",
+                path,
                 cwd=self.cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
             try:
                 out, _ = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 await proc.wait()
                 return f"ERROR: code timed out after {self.timeout}s"

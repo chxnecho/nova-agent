@@ -13,8 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import httpx
 
@@ -28,6 +28,9 @@ log = get_logger("llm")
 StreamCallback = Callable[[str], None]
 
 _RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+
+# module-level sleep handle so tests can swap in a no-op (avoids slow backoff)
+_sleep = asyncio.sleep
 
 
 class LLMError(RuntimeError):
@@ -46,6 +49,7 @@ class OpenAICompatibleProvider:
         max_retries: int = 4,
         extra_headers: dict[str, str] | None = None,
         proxy: str | None = None,
+        client: httpx.AsyncClient | None = None,
     ):
         self.model = model
         self.temperature = temperature
@@ -56,12 +60,16 @@ class OpenAICompatibleProvider:
             "Content-Type": "application/json",
             **(extra_headers or {}),
         }
-        self._client = create_async_client(
-            base_url=base_url.rstrip("/"),
-            headers=self._headers,
-            timeout=httpx.Timeout(timeout_seconds, connect=30.0),
-            proxy=proxy,
-        )
+        if client is not None:
+            # caller-provided client (e.g. httpx.MockTransport in tests)
+            self._client = client
+        else:
+            self._client = create_async_client(
+                base_url=base_url.rstrip("/"),
+                headers=self._headers,
+                timeout=httpx.Timeout(timeout_seconds, connect=30.0),
+                proxy=proxy,
+            )
         # cumulative usage across the lifetime of this provider instance
         self.total_usage = Usage()
 
@@ -110,10 +118,15 @@ class OpenAICompatibleProvider:
                 attempt += 1
                 if attempt > self.max_retries:
                     raise LLMError(f"Giving up after {attempt} attempts: {exc}") from exc
-                delay = min(2.0 ** attempt, 20.0) * (0.5 + random.random())
-                log.warning("LLM request failed (%s); retry %d/%d in %.1fs",
-                            exc, attempt, self.max_retries, delay)
-                await asyncio.sleep(delay)
+                delay = min(2.0**attempt, 20.0) * (0.5 + random.random())
+                log.warning(
+                    "LLM request failed (%s); retry %d/%d in %.1fs",
+                    exc,
+                    attempt,
+                    self.max_retries,
+                    delay,
+                )
+                await _sleep(delay)
 
     def _parse(self, data: dict[str, Any]) -> LLMResponse:
         choice = (data.get("choices") or [{}])[0]
@@ -134,8 +147,9 @@ class OpenAICompatibleProvider:
             finish_reason=choice.get("finish_reason"),
         )
 
-    async def _stream(self, body: dict[str, Any], cb: StreamCallback | None,
-                      rcb: StreamCallback | None = None) -> LLMResponse:
+    async def _stream(
+        self, body: dict[str, Any], cb: StreamCallback | None, rcb: StreamCallback | None = None
+    ) -> LLMResponse:
         body["stream"] = True
         body["stream_options"] = {"include_usage": True}
         content_parts: list[str] = []
@@ -166,7 +180,8 @@ class OpenAICompatibleProvider:
                             rcb(rdelta)
                         for tc in chunk_tool_calls(payload):
                             acc = tool_calls_acc.setdefault(
-                                tc["index"], {"id": "", "name": "", "args": ""})
+                                tc["index"], {"id": "", "name": "", "args": ""}
+                            )
                             acc["id"] = tc.get("id") or acc["id"]
                             acc["name"] += tc.get("name") or ""
                             acc["args"] += tc.get("arguments") or ""
@@ -180,10 +195,10 @@ class OpenAICompatibleProvider:
                 attempt += 1
                 if attempt > self.max_retries:
                     raise LLMError(f"Giving up after {attempt} attempts: {exc}") from exc
-                delay = min(2.0 ** attempt, 20.0) * (0.5 + random.random())
+                delay = min(2.0**attempt, 20.0) * (0.5 + random.random())
                 log.warning("LLM stream failed (%s); retry %d in %.1fs", exc, attempt, delay)
-                await asyncio.sleep(delay)
-                content_parts.clear()   # restart accumulation to avoid duplicates
+                await _sleep(delay)
+                content_parts.clear()  # restart accumulation to avoid duplicates
                 reasoning_parts.clear()
                 tool_calls_acc.clear()
 
@@ -199,13 +214,15 @@ class OpenAICompatibleProvider:
         if not usage.total_tokens:
             usage = Usage(_approx_tokens(str(body)), _approx_tokens(message.content or ""))
         self.total_usage = self.total_usage + usage
-        return LLMResponse(message=message, usage=usage, model=self.model,
-                           finish_reason=finish_reason)
+        return LLMResponse(
+            message=message, usage=usage, model=self.model, finish_reason=finish_reason
+        )
 
 
 # ---------------------------------------------------------------------- #
 # helpers
 # ---------------------------------------------------------------------- #
+
 
 def _parse_stream_chunk(payload: str):
     """Return (content_delta, reasoning_delta, usage_or_None, finish_reason_or_None)."""
@@ -236,12 +253,14 @@ def chunk_tool_calls(payload: str) -> list[dict]:
     for choice in obj.get("choices") or []:
         for tc in (choice.get("delta") or {}).get("tool_calls") or []:
             fn = tc.get("function") or {}
-            out.append({
-                "index": tc.get("index", 0),
-                "id": tc.get("id"),
-                "name": fn.get("name"),
-                "arguments": fn.get("arguments"),
-            })
+            out.append(
+                {
+                    "index": tc.get("index", 0),
+                    "id": tc.get("id"),
+                    "name": fn.get("name"),
+                    "arguments": fn.get("arguments"),
+                }
+            )
     return out
 
 
@@ -262,6 +281,7 @@ def create_provider_from_config(cfg, api_key: str):
     provider_name = cfg.get("llm.provider", "openrouter")
     if provider_name == "mock":
         from .mock import MockProvider
+
         return MockProvider()
     extra = None
     if provider_name == "openrouter":

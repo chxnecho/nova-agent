@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -13,8 +14,17 @@ _FORMAT = "%(asctime)s %(levelname)-7s %(name)s :: %(message)s"
 _configured = False
 
 
-def setup_logging(level: str = "INFO", log_dir: str | None = None) -> None:
-    """Configure root 'nova' logger with console + optional rotating file output."""
+def setup_logging(
+    level: str = "INFO",
+    log_dir: str | None = None,
+    max_bytes: int = 5 * 1024 * 1024,
+    backup_count: int = 5,
+) -> None:
+    """Configure root 'nova' logger with console + optional rotating file output.
+
+    File logs rotate at `max_bytes` and keep `backup_count` previous files,
+    so long-running servers won't grow a single unbounded file.
+    """
     global _configured
     logger = logging.getLogger("nova")
     if _configured:
@@ -31,8 +41,10 @@ def setup_logging(level: str = "INFO", log_dir: str | None = None) -> None:
         if not d.is_absolute():
             d = _PROJECT_ROOT / d
         d.mkdir(parents=True, exist_ok=True)
-        logfile = d / f"nova-{datetime.now(timezone.utc):%Y%m%d}.log"
-        fh = logging.FileHandler(logfile, encoding="utf-8")
+        logfile = d / f"nova-{datetime.now(UTC):%Y%m%d}.log"
+        fh = RotatingFileHandler(
+            logfile, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+        )
         fh.setFormatter(logging.Formatter(_FORMAT))
         logger.addHandler(fh)
 
@@ -52,7 +64,7 @@ class JsonlTraceWriter:
 
     def write(self, event_type: str, payload: dict) -> None:
         record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "type": event_type,
             **payload,
         }

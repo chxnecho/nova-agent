@@ -82,7 +82,9 @@ nova/
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # 35 个单元测试,全部离线运行(MockProvider)
+.venv/bin/python -m pytest tests/ -q     # 50 个单元测试,全部离线运行(MockProvider)
+.venv/bin/ruff check .                   # lint
+.venv/bin/ruff format --check .          # 格式检查
 scripts/smoke_llm.py                     # 真实 API 冒烟测试(消耗少量 token)
 ```
 

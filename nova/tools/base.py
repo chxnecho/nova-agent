@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from nova.log import get_logger
 
@@ -17,18 +18,22 @@ class Tool:
 
     name: str
     description: str
-    parameters: dict[str, Any]          # JSON Schema for the arguments object
+    parameters: dict[str, Any]  # JSON Schema for the arguments object
     handler: Callable[..., Awaitable[str]]
-    danger_level: str = "safe"          # safe | cautious | dangerous
+    danger_level: str = "safe"  # safe | cautious | dangerous
 
     def schema(self) -> dict[str, Any]:
         from nova.llm.base import make_tool_schema
+
         return make_tool_schema(self.name, self.description, self.parameters)
 
     async def run(self, args: dict[str, Any]) -> str:
         try:
-            result = await self.handler(**args) if _accepts_kwargs(self.handler) \
+            result = (
+                await self.handler(**args)
+                if _accepts_kwargs(self.handler)
                 else await self.handler(args)
+            )
             return result
         except Exception as exc:  # surface errors back to the model, never crash the loop
             log.warning("tool %s failed: %s", self.name, exc)
@@ -47,9 +52,16 @@ def tool(
     danger_level: str = "safe",
 ) -> Callable[[Callable[..., Awaitable[str]]], Tool]:
     """Decorator that wraps an async function into a Tool."""
+
     def deco(fn: Callable[..., Awaitable[str]]) -> Tool:
-        return Tool(name=name, description=description,
-                    parameters=parameters, handler=fn, danger_level=danger_level)
+        return Tool(
+            name=name,
+            description=description,
+            parameters=parameters,
+            handler=fn,
+            danger_level=danger_level,
+        )
+
     return deco
 
 
@@ -88,6 +100,9 @@ class ToolRegistry:
         t = self.get(call.name)
         if t is None:
             return f"ERROR: unknown tool '{call.name}'. Available: {', '.join(self.tools)}"
-        log.info("executing tool %s(%s)", call.name,
-                 {k: (str(v)[:60]) for k, v in call.arguments.items()})
+        log.info(
+            "executing tool %s(%s)",
+            call.name,
+            {k: (str(v)[:60]) for k, v in call.arguments.items()},
+        )
         return await t.run(call.arguments)

@@ -19,17 +19,22 @@ log = get_logger("net")
 
 def normalized_env_proxy() -> str | None:
     """Best-effort read+normalize of proxy env vars for httpx."""
-    raw = (os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
-           or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-           or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-           or "").strip()
+    raw = (
+        os.environ.get("ALL_PROXY")
+        or os.environ.get("all_proxy")  # noqa: SIM112 - some CLIs export lowercase
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+        or ""
+    ).strip()
     if not raw:
         return None
     low = raw.lower()
-    if low.startswith("socks://"):            # httpx only knows socks5/socks4
-        raw = "socks5://" + raw[len("socks://"):]
+    if low.startswith("socks://"):  # httpx only knows socks5/socks4
+        raw = "socks5://" + raw[len("socks://") :]
     elif low.startswith("socks4a://"):
-        raw = "socks4://" + raw[len("socks4a://"):]
+        raw = "socks4://" + raw[len("socks4a://") :]
     return raw
 
 
@@ -45,6 +50,7 @@ def create_async_client(**kwargs) -> httpx.AsyncClient:
     host = ""
     try:
         from urllib.parse import urlparse
+
         target = kwargs.get("base_url") or ""
         host = urlparse(target if "//" in target else "https://" + target).hostname or ""
     except Exception:
@@ -56,6 +62,10 @@ def create_async_client(**kwargs) -> httpx.AsyncClient:
     try:
         return httpx.AsyncClient(proxy=proxy, **kwargs)
     except (ValueError, ImportError, TypeError) as exc:
-        log.warning("proxy %r unusable (%s: %s); falling back to direct connection",
-                    proxy, type(exc).__name__, exc)
+        log.warning(
+            "proxy %r unusable (%s: %s); falling back to direct connection",
+            proxy,
+            type(exc).__name__,
+            exc,
+        )
         return httpx.AsyncClient(trust_env=False, **kwargs)

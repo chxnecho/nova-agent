@@ -24,26 +24,29 @@ class WebTools:
     each hop. An optional hostname allow-list can be supplied via config.
     """
 
-    def __init__(self, allow_private: bool = False,
-                 allowed_domains: list[str] | None = None):
+    def __init__(self, allow_private: bool = False, allowed_domains: list[str] | None = None):
         self.allow_private = allow_private
         self.allowed_domains = allowed_domains or []
 
     def register(self, registry) -> None:
-        registry.register(tool(
-            name="web_fetch",
-            description="Fetch a web page by URL and return its readable text "
-                        "(HTML tags stripped). Works for docs, articles, APIs returning JSON.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "max_chars": {"type": "integer",
-                                  "description": "Truncate content to this length (default 20000)"},
+        registry.register(
+            tool(
+                name="web_fetch",
+                description="Fetch a web page by URL and return its readable text "
+                "(HTML tags stripped). Works for docs, articles, APIs returning JSON.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "max_chars": {
+                            "type": "integer",
+                            "description": "Truncate content to this length (default 20000)",
+                        },
+                    },
+                    "required": ["url"],
                 },
-                "required": ["url"],
-            },
-        )(self.fetch))
+            )(self.fetch)
+        )
 
     # ------------------------------------------------------------------ #
 
@@ -59,20 +62,24 @@ class WebTools:
 
         # optional hostname allow-list
         if self.allowed_domains and not any(
-                host == d or host.endswith("." + d) for d in self.allowed_domains):
+            host == d or host.endswith("." + d) for d in self.allowed_domains
+        ):
             raise ValueError(f"host '{host}' is not in tools.web.allowed_domains")
 
         # SSRF guard: refuse non-public destinations
         if not self.allow_private and _host_is_private(host):
             raise ValueError(
                 f"URL resolves to a private/internal address ('{host}'); "
-                "blocked by the SSRF guard (tools.web.allow_private=false)")
+                "blocked by the SSRF guard (tools.web.allow_private=false)"
+            )
 
         # rebuild a clean URL so path/redirect trickery can't smuggle a scheme
-        return (f"{scheme}://{host}"
-                + (f":{parsed.port}" if parsed.port else "")
-                + (parsed.path or "/")
-                + (f"?{parsed.query}" if parsed.query else ""))
+        return (
+            f"{scheme}://{host}"
+            + (f":{parsed.port}" if parsed.port else "")
+            + (parsed.path or "/")
+            + (f"?{parsed.query}" if parsed.query else "")
+        )
 
     async def fetch(self, url: str, max_chars: int | None = None) -> str:
         limit = min(max_chars or MAX_CONTENT, MAX_CONTENT)
@@ -84,8 +91,9 @@ class WebTools:
 
         # follow redirects ourselves so every hop is re-validated against SSRF
         for _ in range(_MAX_REDIRECTS + 1):
-            async with create_async_client(headers=headers, timeout=_TIMEOUT,
-                                           follow_redirects=False) as c:
+            async with create_async_client(
+                headers=headers, timeout=_TIMEOUT, follow_redirects=False
+            ) as c:
                 resp = await c.get(target)
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("location")
@@ -112,15 +120,21 @@ def _host_is_private(host: str) -> bool:
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
-        return True                       # unresolvable -> fail closed
+        return True  # unresolvable -> fail closed
     for info in infos:
         ip = info[4][0]
         try:
             addr = ipaddress.ip_address(ip)
         except ValueError:
-            return True                   # malformed -> fail closed
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return True  # malformed -> fail closed
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_unspecified
+        ):
             return True
     return False
 

@@ -12,9 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nova.config import api_key_for, load_config  # noqa: E402
-from nova.llm.base import Message, make_tool_schema  # noqa: E402
-from nova.llm.provider import create_provider_from_config  # noqa: E402
+from nova.config import api_key_for, load_config
+from nova.llm.base import Message, make_tool_schema
+from nova.llm.provider import create_provider_from_config
 
 
 async def main() -> None:
@@ -38,17 +38,19 @@ async def main() -> None:
     assert "3" in streamed_text
 
     # --- 3. tool calling ---
-    tools = [make_tool_schema(
-        name="get_weather",
-        description="Get current weather for a city.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "City name"},
+    tools = [
+        make_tool_schema(
+            name="get_weather",
+            description="Get current weather for a city.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "City name"},
+                },
+                "required": ["city"],
             },
-            "required": ["city"],
-        },
-    )]
+        )
+    ]
     resp = await provider.chat(
         [Message(role="user", content="北京今天天气怎么样?请调用工具查询。")],
         tools=tools,

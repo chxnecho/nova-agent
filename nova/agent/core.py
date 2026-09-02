@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
 
 from nova.llm.base import LLMResponse, Message
 from nova.log import JsonlTraceWriter, get_logger
@@ -22,7 +22,7 @@ DEFAULT_COST_PER_MTOK = (0.3, 1.2)
 @dataclass
 class StepRecord:
     step: int
-    kind: str                      # "think" | "act" | "final"
+    kind: str  # "think" | "act" | "final"
     content: str = ""
     tool_name: str | None = None
     tool_args: dict | None = None
@@ -38,7 +38,7 @@ class RunResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float = 0.0
-    stopped_reason: str = "completed"   # completed | max_steps | max_cost
+    stopped_reason: str = "completed"  # completed | max_steps | max_cost
 
 
 StepCallback = Callable[[StepRecord], None]
@@ -58,6 +58,8 @@ class Agent:
         max_cost_usd: float = 2.0,
         reflect_on_error: bool = True,
         max_consecutive_errors: int | None = None,
+        summarize_threshold: int | None = None,
+        context_window_messages: int = 24,
         trace_path: Path | None = None,
         on_step: StepCallback | None = None,
         stream_callback: Callable[[str], None] | None = None,
@@ -74,6 +76,8 @@ class Agent:
         self.max_cost_usd = max_cost_usd
         self.reflect_on_error = reflect_on_error
         self.max_consecutive_errors = max_consecutive_errors
+        self.summarize_threshold = summarize_threshold
+        self.context_window_messages = context_window_messages
         self.on_step = on_step or (lambda s: None)
         self.stream_callback = stream_callback
         self.reasoning_callback = reasoning_callback
@@ -88,17 +92,68 @@ class Agent:
         p, c = self.cost_per_mtok
         return usage.prompt_tokens / 1e6 * p + usage.completion_tokens / 1e6 * c
 
+    async def _maybe_compress(self) -> None:
+        """Bound history growth: when the non-system message count exceeds
+        `summarize_threshold`, fold the oldest messages (beyond the recent
+        `context_window_messages`) into a single LLM-generated summary and
+        drop them, otherwise truncate without a summary if summarization fails.
+        """
+        if not self.summarize_threshold or not self.context_window_messages:
+            return
+        non_system = [(i, m) for i, m in enumerate(self.history) if m.role != "system"]
+        if len(non_system) <= self.summarize_threshold:
+            return
+        to_keep = non_system[-self.context_window_messages :]
+        to_summarize = [m for _, m in non_system[: -self.context_window_messages]]
+
+        summary = await self._summarize(to_summarize)
+        new_history = [m for m in self.history if m.role == "system"]
+        if summary:
+            new_history.append(
+                Message(
+                    role="system",
+                    content=("Prior context (summarized):\n" + summary),
+                )
+            )
+        new_history.extend(m for _, m in to_keep)
+        self.history = new_history
+        log.info(
+            "compressed history: summarized %d older messages, kept %d",
+            len(to_summarize),
+            len(to_keep),
+        )
+
+    async def _summarize(self, messages: list[Message]) -> str:
+        """Ask the model to condense older messages. Empty string on failure."""
+        transcript = "\n".join(f"[{m.role}] {m.content or ''}" for m in messages if m.content)
+        if not transcript.strip():
+            return ""
+        prompt = (
+            "You are compressing older context. Summarize the conversation below "
+            "into a concise memory of key facts, decisions, and outcomes ONLY "
+            "(no commentary, no fluff). It will be re-injected as system context:\n\n" + transcript
+        )
+        try:
+            resp = await self.provider.chat([Message(role="user", content=prompt)])
+            return (resp.message.content or "").strip()
+        except Exception as exc:  # never let summarization break a run
+            log.warning("history summarization failed (%s); truncating without summary", exc)
+            return ""
+
     def _emit(self, record: StepRecord) -> None:
         if self.trace:
-            self.trace.write("step", {
-                "step": record.step,
-                "kind": record.kind,
-                "content": record.content[:2000],
-                "tool": record.tool_name,
-                "args": record.tool_args,
-                "observation": (record.observation or "")[:2000],
-                "duration_s": round(record.duration_s, 3),
-            })
+            self.trace.write(
+                "step",
+                {
+                    "step": record.step,
+                    "kind": record.kind,
+                    "content": record.content[:2000],
+                    "tool": record.tool_name,
+                    "args": record.tool_args,
+                    "observation": (record.observation or "")[:2000],
+                    "duration_s": round(record.duration_s, 3),
+                },
+            )
         self.on_step(record)
 
     def reset(self, system_extra: str | None = None) -> None:
@@ -124,6 +179,9 @@ class Agent:
             result.steps_used = step_no
             t0 = time.monotonic()
 
+            # ---- bound context growth before every LLM call ---- #
+            await self._maybe_compress()
+
             resp: LLMResponse = await self.provider.chat(
                 self.history,
                 tools=self.registry.schemas(),
@@ -144,20 +202,30 @@ class Agent:
                 return result
 
             msg = resp.message
-            log.info("[step %d] finish=%s tool_calls=%s tokens=%dt",
-                     step_no, resp.finish_reason,
-                     [tc.name for tc in msg.tool_calls], resp.usage.total_tokens)
+            log.info(
+                "[step %d] finish=%s tool_calls=%s tokens=%dt",
+                step_no,
+                resp.finish_reason,
+                [tc.name for tc in msg.tool_calls],
+                resp.usage.total_tokens,
+            )
             self.history.append(msg)
 
             # ---- cooperative stop: finalize cleanly, keep history valid ---- #
             if should_stop is not None and should_stop():
                 for tc in msg.tool_calls:
-                    self.history.append(Message(
-                        role="tool", content="(stopped by user)",
-                        tool_call_id=tc.id, name=tc.name))
+                    self.history.append(
+                        Message(
+                            role="tool",
+                            content="(stopped by user)",
+                            tool_call_id=tc.id,
+                            name=tc.name,
+                        )
+                    )
                 answer = (msg.content or "").strip() or "(已由用户停止)"
-                rec = StepRecord(step=step_no, kind="final", content=answer,
-                                 duration_s=time.monotonic() - t0)
+                rec = StepRecord(
+                    step=step_no, kind="final", content=answer, duration_s=time.monotonic() - t0
+                )
                 self._emit(rec)
                 result.steps.append(rec)
                 result.final_answer = answer
@@ -168,8 +236,9 @@ class Agent:
             # ---- no tool calls => the model believes it is done ---- #
             if not msg.tool_calls:
                 answer = (msg.content or "").strip() or "(empty response)"
-                rec = StepRecord(step=step_no, kind="final", content=answer,
-                                 duration_s=time.monotonic() - t0)
+                rec = StepRecord(
+                    step=step_no, kind="final", content=answer, duration_s=time.monotonic() - t0
+                )
                 self._emit(rec)
                 result.steps.append(rec)
                 result.final_answer = answer
@@ -177,8 +246,12 @@ class Agent:
 
             # ---- think/announce step ---- #
             if msg.content:
-                rec = StepRecord(step=step_no, kind="think", content=msg.content,
-                                 duration_s=time.monotonic() - t0)
+                rec = StepRecord(
+                    step=step_no,
+                    kind="think",
+                    content=msg.content,
+                    duration_s=time.monotonic() - t0,
+                )
                 self._emit(rec)
                 result.steps.append(rec)
 
@@ -191,19 +264,27 @@ class Agent:
                     if tool_obj is not None and tool_obj.danger_level == "dangerous":
                         allowed = await self.approval_callback(tc.name, tc.arguments)
                         if not allowed:
-                            observation = ("(用户拒绝了本次操作;请说明更安全的替代方案,"
-                                           "或直接基于已有信息继续)")
+                            observation = (
+                                "(用户拒绝了本次操作;请说明更安全的替代方案,或直接基于已有信息继续)"
+                            )
                             rec = StepRecord(
-                                step=step_no, kind="act",
-                                tool_name=tc.name, tool_args=tc.arguments,
+                                step=step_no,
+                                kind="act",
+                                tool_name=tc.name,
+                                tool_args=tc.arguments,
                                 observation=observation,
                                 duration_s=time.monotonic() - t1,
                             )
                             self._emit(rec)
                             result.steps.append(rec)
-                            self.history.append(Message(
-                                role="tool", content=observation,
-                                tool_call_id=tc.id, name=tc.name))
+                            self.history.append(
+                                Message(
+                                    role="tool",
+                                    content=observation,
+                                    tool_call_id=tc.id,
+                                    name=tc.name,
+                                )
+                            )
                             continue
                 observation = await self.registry.execute(tc)
                 if observation.startswith("ERROR"):
@@ -212,19 +293,23 @@ class Agent:
                 else:
                     consecutive_errors = 0
                 rec = StepRecord(
-                    step=step_no, kind="act",
-                    tool_name=tc.name, tool_args=tc.arguments,
+                    step=step_no,
+                    kind="act",
+                    tool_name=tc.name,
+                    tool_args=tc.arguments,
                     observation=observation,
                     duration_s=time.monotonic() - t1,
                 )
                 self._emit(rec)
                 result.steps.append(rec)
-                self.history.append(Message(
-                    role="tool",
-                    content=observation,
-                    tool_call_id=tc.id,
-                    name=tc.name,
-                ))
+                self.history.append(
+                    Message(
+                        role="tool",
+                        content=observation,
+                        tool_call_id=tc.id,
+                        name=tc.name,
+                    )
+                )
 
             # ---- reflect after failures ---- #
             if had_error and self.reflect_on_error:
@@ -246,9 +331,12 @@ class Agent:
 
             # ---- cooperative stop between steps ---- #
             if should_stop is not None and should_stop():
-                rec = StepRecord(step=step_no, kind="final",
-                                 content="(任务已由用户停止)",
-                                 duration_s=time.monotonic() - t0)
+                rec = StepRecord(
+                    step=step_no,
+                    kind="final",
+                    content="(任务已由用户停止)",
+                    duration_s=time.monotonic() - t0,
+                )
                 self._emit(rec)
                 result.steps.append(rec)
                 result.final_answer = rec.content
@@ -275,27 +363,36 @@ def build_default_agent(cfg, provider, workspace: str | Path = ".") -> Agent:
     registry = ToolRegistry()
     FilesystemTools(workspace).register(registry)
     if cfg.get("tools.shell.enabled", True):
-        ShellTool(str(workspace), int(cfg.get("tools.shell.timeout_seconds", 60)),
-                  workspace_root=str(workspace)).register(registry)
+        ShellTool(
+            str(workspace),
+            int(cfg.get("tools.shell.timeout_seconds", 60)),
+            workspace_root=str(workspace),
+        ).register(registry)
     if cfg.get("tools.python_repl.enabled", True):
-        PythonReplTool(str(workspace), int(cfg.get("tools.python_repl.timeout_seconds", 30))).register(registry)
+        PythonReplTool(
+            str(workspace), int(cfg.get("tools.python_repl.timeout_seconds", 30))
+        ).register(registry)
     if cfg.get("tools.web.enabled", True):
         allow_private = bool(cfg.get("tools.web.allow_private", False))
         domains = cfg.get("tools.web.allowed_domains")
         if isinstance(domains, str):
             domains = [d.strip() for d in domains.split(",") if d.strip()]
-        WebTools(allow_private=allow_private,
-                 allowed_domains=domains or None).register(registry)
+        WebTools(allow_private=allow_private, allowed_domains=domains or None).register(registry)
 
     memory_system_prompt = ""
     if cfg.get("memory.enabled", True):
         from nova.config import PROJECT_ROOT
+
         db_path = Path(cfg.get("memory.db_path", ".nova/memory.sqlite3"))
         if not db_path.is_absolute():
             db_path = PROJECT_ROOT / db_path
         from nova.memory.embeddings import HashEmbedder
         from nova.memory.store import MemoryStore
-        store = MemoryStore(db_path, embedder=HashEmbedder(int(cfg.get("memory.embedding.dim", 512))))
+
+        store = MemoryStore(
+            db_path,
+            embedder=HashEmbedder(int(cfg.get("memory.embedding.dim", 512))),
+        )
         MemoryTools(store, workspace=workspace).register(registry)
         memory_system_prompt = (
             "## Long-term memory\n"
@@ -307,14 +404,22 @@ def build_default_agent(cfg, provider, workspace: str | Path = ".") -> Agent:
 
     trace_dir = cfg.get("logging.dir", ".nova/logs")
     trace_path = Path(trace_dir) / "trace.jsonl"
+    cost = cfg.get("agent.cost_per_mtok") or (0.3, 1.2)
+    if isinstance(cost, (list, tuple)) and len(cost) == 2:
+        cost = (float(cost[0]), float(cost[1]))
+    else:
+        cost = DEFAULT_COST_PER_MTOK
     return Agent(
         provider,
         registry,
         workspace=workspace,
         max_steps=int(cfg.get("agent.max_steps", 40)),
         max_cost_usd=float(cfg.get("agent.max_cost_usd", 2.0)),
+        cost_per_mtok=cost,
         reflect_on_error=bool(cfg.get("agent.reflect_on_error", True)),
         max_consecutive_errors=cfg.get("agent.max_consecutive_errors"),
+        summarize_threshold=cfg.get("memory.summarize_threshold"),
+        context_window_messages=int(cfg.get("memory.context_window_messages", 24)),
         trace_path=trace_path,
         system_extra=memory_system_prompt or None,
     )

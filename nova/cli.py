@@ -13,11 +13,11 @@ import os
 import sys
 from pathlib import Path
 
-from nova.agent.core import Agent, build_default_agent
+from nova.agent.core import build_default_agent
 from nova.config import api_key_for, load_config
 from nova.llm.base import Message
 from nova.llm.provider import create_provider_from_config
-from nova.log import get_logger, setup_logging
+from nova.log import setup_logging
 
 
 def _print_step(step) -> None:
@@ -34,14 +34,18 @@ def _print_step(step) -> None:
 
 async def cmd_run(cfg, task: str, workspace: Path) -> int:
     provider = create_provider_from_config(cfg, api_key_for(cfg))
-    agent = build_default_agent(cfg, provider, workspace=workspace)
-    result = await agent.run(task)
+    try:
+        agent = build_default_agent(cfg, provider, workspace=workspace)
+        result = await agent.run(task)
+    finally:
+        await provider.aclose()
 
     print(f"\n{'=' * 60}\n{result.final_answer}\n{'=' * 60}")
-    print(f"steps={result.steps_used} "
-          f"tokens={result.prompt_tokens}+{result.completion_tokens} "
-          f"cost≈${result.cost_usd:.4f} reason={result.stopped_reason}")
-    await provider.aclose()
+    print(
+        f"steps={result.steps_used} "
+        f"tokens={result.prompt_tokens}+{result.completion_tokens} "
+        f"cost≈${result.cost_usd:.4f} reason={result.stopped_reason}"
+    )
     return 0 if result.stopped_reason == "completed" else 1
 
 
@@ -58,17 +62,23 @@ async def cmd_team(cfg, task: str, workspace: Path) -> int:
             print(f"\n\033[33m[executor {payload['index']}]\033[0m {payload['title']}")
         elif event_type == "critique":
             color = "\033[32m" if payload["verdict"] == "APPROVED" else "\033[31m"
-            print(f"{color}[critic round {payload['round']}]\033[0m "
-                  f"{payload['verdict']} - {payload['reasoning'][:200]}")
+            print(
+                f"{color}[critic round {payload['round']}]\033[0m "
+                f"{payload['verdict']} - {payload['reasoning'][:200]}"
+            )
 
     team = AgentTeam(cfg, provider, workspace=workspace, on_event=on_event)
     print(f"\033[1m[team]\033[0m task: {task}")
-    result = await team.run(task)
+    try:
+        result = await team.run(task)
+    finally:
+        await provider.aclose()
 
     print(f"\n{'=' * 60}\n{result.final_answer}\n{'=' * 60}")
-    print(f"subtasks={len(result.subtask_results)} rounds={result.rounds} "
-          f"tokens={provider.total_usage.total_tokens}")
-    await provider.aclose()
+    print(
+        f"subtasks={len(result.subtask_results)} rounds={result.rounds} "
+        f"tokens={provider.total_usage.total_tokens}"
+    )
     return 0
 
 
@@ -96,10 +106,11 @@ async def cmd_chat(cfg, workspace: Path) -> int:
         agent.history.append(Message(role="user", content=user))
         try:
             while True:
-                resp = await provider.chat(agent.history,
-                                           tools=agent.registry.schemas(),
-                                           stream_callback=lambda d: print(d, end="",
-                                                                           flush=True))
+                resp = await provider.chat(
+                    agent.history,
+                    tools=agent.registry.schemas(),
+                    stream_callback=lambda d: print(d, end="", flush=True),
+                )
                 print()
                 msg = resp.message
                 agent.history.append(msg)
@@ -108,8 +119,9 @@ async def cmd_chat(cfg, workspace: Path) -> int:
                 for tc in msg.tool_calls:
                     observation = await agent.registry.execute(tc)
                     print(f"\033[90m[{tc.name}] {observation[:400]}\033[0m")
-                    agent.history.append(Message(role="tool", content=observation,
-                                                 tool_call_id=tc.id, name=tc.name))
+                    agent.history.append(
+                        Message(role="tool", content=observation, tool_call_id=tc.id, name=tc.name)
+                    )
         except KeyboardInterrupt:
             print("\n(interrupted)")
         usage = provider.total_usage
@@ -130,11 +142,13 @@ def main() -> None:
     serve_p = sub.add_parser("serve")
     serve_p.add_argument("--host", default=None)
     serve_p.add_argument("--port", type=int, default=None)
-    serve_p.add_argument("--no-open", action="store_true",
-                         help="Do not auto-open the browser")
-    serve_p.add_argument("--workspace", default=".",
-                         help="Directory the web agent may read/write/execute in. "
-                              "Use a dedicated sandbox directory in production.")
+    serve_p.add_argument("--no-open", action="store_true", help="Do not auto-open the browser")
+    serve_p.add_argument(
+        "--workspace",
+        default=".",
+        help="Directory the web agent may read/write/execute in. "
+        "Use a dedicated sandbox directory in production.",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -152,23 +166,30 @@ def main() -> None:
         import webbrowser
 
         import uvicorn
+
         from nova.web.server import create_app
+
         host = args.host or str(cfg.get("server.host", "127.0.0.1"))
         port = args.port or int(cfg.get("server.port", 8321))
         url = f"http://{host}:{port}"
         print(f"NovaAgent web UI: {url}")
         print(f"Agent workspace : {workspace.resolve()}")
         if (workspace.resolve() / ".env").exists():
-            print("\033[31mWARNING: the workspace contains a .env file — the agent can "
-                  "read it. Use --workspace to point at a dedicated sandbox directory.\033[0m")
+            print(
+                "\033[31mWARNING: the workspace contains a .env file — the agent can "
+                "read it. Use --workspace to point at a dedicated sandbox directory.\033[0m"
+            )
         if os.environ.get("NOVA_WEB_TOKEN") or cfg.get("server.auth_token"):
             print("API auth        : enabled (Bearer token required)")
         elif host not in ("127.0.0.1", "localhost"):
-            print("\033[33mWARNING: no NOVA_WEB_TOKEN set — anyone who can reach this "
-                  "port can use your API key and run commands. Set NOVA_WEB_TOKEN "
-                  "or keep the server on 127.0.0.1 behind a reverse proxy.\033[0m")
+            print(
+                "\033[33mWARNING: no NOVA_WEB_TOKEN set — anyone who can reach this "
+                "port can use your API key and run commands. Set NOVA_WEB_TOKEN "
+                "or keep the server on 127.0.0.1 behind a reverse proxy.\033[0m"
+            )
 
         if not args.no_open:
+
             def open_when_ready() -> None:
                 """Only launch the browser once the port actually accepts connections."""
                 deadline = time.time() + 30
@@ -183,8 +204,7 @@ def main() -> None:
                 print("(server did not become ready; open the URL manually)")
 
             threading.Thread(target=open_when_ready, daemon=True).start()
-        uvicorn.run(create_app(cfg, workspace=workspace), host=host, port=port,
-                    log_level="info")
+        uvicorn.run(create_app(cfg, workspace=workspace), host=host, port=port, log_level="info")
         code = 0
     else:
         code = asyncio.run(cmd_chat(cfg, workspace))

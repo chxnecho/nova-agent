@@ -23,12 +23,30 @@ MAX_OUTPUT = 15000
 # against a whitespace-normalized copy of the command, so spacing tricks like
 # `rm -rf  /` don't bypass it.
 _DENYLIST = (
-    "rm -rf /", "rm -rf /*", "rm -fr /", "rm -fr /*",
-    "mkfs", "dd if=/dev/zero", "shutdown", "reboot",
-    "> /dev/sd", "> /dev/mem", ">/dev/sd", ">/dev/mem",
-    "chmod -r 777 /", "chmod 777 /", "chmod -r 777 /*",
-    ">" + " /etc/passwd", ">" + " /etc/shadow", ">" + " /etc/hosts",
-    "fdisk", "parted", "pvcreate", "lvremove", "mkfs.xfs", "mkfs.ext4",
+    "rm -rf /",
+    "rm -rf /*",
+    "rm -fr /",
+    "rm -fr /*",
+    "mkfs",
+    "dd if=/dev/zero",
+    "shutdown",
+    "reboot",
+    "> /dev/sd",
+    "> /dev/mem",
+    ">/dev/sd",
+    ">/dev/mem",
+    "chmod -r 777 /",
+    "chmod 777 /",
+    "chmod -r 777 /*",
+    ">" + " /etc/passwd",
+    ">" + " /etc/shadow",
+    ">" + " /etc/hosts",
+    "fdisk",
+    "parted",
+    "pvcreate",
+    "lvremove",
+    "mkfs.xfs",
+    "mkfs.ext4",
 )
 
 
@@ -36,8 +54,20 @@ def _normalize(command: str) -> str:
     return " ".join(command.split())
 
 
-_WRITE_VERBS = {"rm", "mv", "cp", "touch", "mkdir", "truncate", "dd",
-                "unlink", "ln", "chmod", "chown", "tee"}
+_WRITE_VERBS = {
+    "rm",
+    "mv",
+    "cp",
+    "touch",
+    "mkdir",
+    "truncate",
+    "dd",
+    "unlink",
+    "ln",
+    "chmod",
+    "chown",
+    "tee",
+}
 _WRITE_REDIRECT = {">", ">>", "&>", "&>>"}
 
 
@@ -45,10 +75,10 @@ def _is_outside(target: str, root: str) -> bool:
     p = os.path.normpath(os.path.abspath(target))
     r = os.path.normpath(os.path.abspath(root))
     if p == r:
-        return False                        # points at the root itself: inside
+        return False  # points at the root itself: inside
     try:
         return os.path.commonpath([p, r]) != r
-    except ValueError:                      # different prefixes/drives
+    except ValueError:  # different prefixes/drives
         return True
 
 
@@ -56,14 +86,12 @@ def _command_escapes_sandbox(command: str, root: str) -> bool:
     """True when the command writes to an absolute path outside `root`."""
     try:
         toks = shlex.split(command)
-    except ValueError:                      # unparseable -> let the shell decide
+    except ValueError:  # unparseable -> let the shell decide
         return False
     for i, t in enumerate(toks):
-        if t in _WRITE_REDIRECT and i + 1 < len(toks):
-            nxt = toks[i + 1]
-            if nxt.startswith("/") and _is_outside(nxt, root):
-                return True
-        elif t in _WRITE_VERBS and i + 1 < len(toks):
+        if (t in _WRITE_REDIRECT and i + 1 < len(toks)) or (
+            t in _WRITE_VERBS and i + 1 < len(toks)
+        ):
             nxt = toks[i + 1]
             if nxt.startswith("/") and _is_outside(nxt, root):
                 return True
@@ -71,29 +99,32 @@ def _command_escapes_sandbox(command: str, root: str) -> bool:
 
 
 class ShellTool:
-    def __init__(self, cwd: str, timeout_seconds: int = 60,
-                 workspace_root: str | None = None):
+    def __init__(self, cwd: str, timeout_seconds: int = 60, workspace_root: str | None = None):
         self.cwd = cwd
         self.timeout = timeout_seconds
         self.workspace_root = workspace_root or cwd
 
     def register(self, registry) -> None:
-        registry.register(tool(
-            name="run_shell",
-            description="Execute a shell command in the workspace directory and return "
-                        "combined stdout+stderr. Use for git, grep, ls, builds, tests, etc.\n"
-                        "Writes to absolute paths outside the workspace are blocked.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "timeout_seconds": {"type": "integer",
-                                        "description": "Override timeout (max 300)"},
+        registry.register(
+            tool(
+                name="run_shell",
+                description="Execute a shell command in the workspace directory and return "
+                "combined stdout+stderr. Use for git, grep, ls, builds, tests, etc.\n"
+                "Writes to absolute paths outside the workspace are blocked.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "description": "Override timeout (max 300)",
+                        },
+                    },
+                    "required": ["command"],
                 },
-                "required": ["command"],
-            },
-            danger_level="dangerous",
-        )(self.run))
+                danger_level="dangerous",
+            )(self.run)
+        )
 
     async def run(self, command: str, timeout_seconds: int | None = None) -> str:
         norm = _normalize(command)
@@ -104,8 +135,10 @@ class ShellTool:
 
         if _command_escapes_sandbox(command, self.workspace_root):
             log.warning("blocked write outside sandbox: %s", command[:100])
-            return (f"ERROR: command attempts to write outside the workspace "
-                    f"sandbox ({self.workspace_root})")
+            return (
+                f"ERROR: command attempts to write outside the workspace "
+                f"sandbox ({self.workspace_root})"
+            )
 
         timeout = min(timeout_seconds or self.timeout, 300)
         try:
@@ -120,7 +153,7 @@ class ShellTool:
 
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.wait()
             return f"ERROR: timed out after {timeout}s"
@@ -129,7 +162,9 @@ class ShellTool:
         head, tail = text[:MAX_OUTPUT], ""
         if len(text) > MAX_OUTPUT:
             tail = f"\n...[{len(text) - MAX_OUTPUT} more chars truncated]..."
-            head = text[: MAX_OUTPUT // 2] + "\n...\n" + text[-MAX_OUTPUT // 2:]
+            head = text[: MAX_OUTPUT // 2] + "\n...\n" + text[-MAX_OUTPUT // 2 :]
         status = "OK" if proc.returncode == 0 else f"exit {proc.returncode}"
-        return f"[{status}] $ {shlex.quote(command)}\n{head}{tail or ''}".rstrip() \
+        return (
+            f"[{status}] $ {shlex.quote(command)}\n{head}{tail or ''}".rstrip()
             or f"[{status}] (no output)"
+        )

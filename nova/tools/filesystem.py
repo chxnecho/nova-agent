@@ -23,7 +23,7 @@ class FilesystemTools:
             tool(
                 name="read_file",
                 description="Read a text file inside the workspace. "
-                            "Optionally read only a line range (1-based, inclusive).",
+                "Optionally read only a line range (1-based, inclusive).",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -37,7 +37,7 @@ class FilesystemTools:
             tool(
                 name="write_file",
                 description="Create or overwrite a text file with the given content. "
-                            "Parent directories are created automatically.",
+                "Parent directories are created automatically.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -51,7 +51,7 @@ class FilesystemTools:
             tool(
                 name="edit_file",
                 description="Replace an exact old_text snippet with new_text in a file. "
-                            "Fails if old_text is not found or is not unique.",
+                "Fails if old_text is not found or is not unique.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -77,16 +77,31 @@ class FilesystemTools:
 
     # ------------------------------------------------------------------ #
 
-    async def read_file(self, path: str, start_line: int | None = None,
-                        end_line: int | None = None) -> str:
+    async def read_file(
+        self, path: str, start_line: int | None = None, end_line: int | None = None
+    ) -> str:
         p = self._resolve(path)
-        data = p.read_text(encoding="utf-8")
         if start_line or end_line:
+            # line-range read: load fully only when the requested range is set
+            data = p.read_text(encoding="utf-8")
             lines = data.splitlines()
             s = max((start_line or 1) - 1, 0)
             e = end_line or len(lines)
             return "\n".join(lines[s:e])
-        return data[:50000]
+        # stream up to the cap without loading the whole file into memory
+        cap = 50000
+        chunks = []
+        total = 0
+        with p.open(encoding="utf-8", errors="replace") as f:
+            while True:
+                block = f.read(65536)
+                if not block:
+                    break
+                chunks.append(block)
+                total += len(block)
+                if total >= cap:
+                    break
+        return "".join(chunks)[:cap]
 
     async def write_file(self, path: str, content: str) -> str:
         p = self._resolve(path)

@@ -1,5 +1,4 @@
 import pytest
-
 from nova.memory.embeddings import HashEmbedder, cosine
 from nova.memory.store import MemoryStore, chunk_text
 

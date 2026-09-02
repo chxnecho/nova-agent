@@ -1,7 +1,6 @@
 import asyncio
 
 import pytest
-
 from nova.llm.base import ToolCall
 from nova.tools.base import ToolRegistry, tool
 from nova.tools.filesystem import FilesystemTools
@@ -64,10 +63,11 @@ async def test_registry_execute_unknown_tool():
 
 # ---- shell: enhanced denylist + workspace-write guard ----
 
+
 def test_shell_normalized_denylist(tmp_path):
     """Extra whitespace must not bypass the denylist (regression)."""
     sh = ShellTool(str(tmp_path))
-    r = asyncio.run(sh.run("rm -rf  /"))    # double space
+    r = asyncio.run(sh.run("rm -rf  /"))  # double space
     assert r.startswith("ERROR: command blocked")
     r2 = asyncio.run(sh.run("rm -fr /*"))
     assert r2.startswith("ERROR: command blocked")
@@ -89,8 +89,10 @@ def test_shell_write_inside_sandbox_allowed(tmp_path):
 
 # ---- web_fetch: SSRF guard ----
 
+
 def test_web_blocks_loopback():
     from nova.tools.web import WebTools
+
     wt = WebTools()
     with pytest.raises(ValueError):
         wt._validate_url("http://127.0.0.1:8080/admin")
@@ -100,6 +102,7 @@ def test_web_blocks_loopback():
 
 def test_web_blocks_non_http_scheme():
     from nova.tools.web import WebTools
+
     with pytest.raises(ValueError):
         WebTools()._validate_url("file:///etc/passwd")
     with pytest.raises(ValueError):
@@ -108,13 +111,14 @@ def test_web_blocks_non_http_scheme():
 
 def test_web_allow_private_opt_in():
     from nova.tools.web import WebTools
+
     wt = WebTools(allow_private=True)
     assert wt._validate_url("http://127.0.0.1:8080/x") == "http://127.0.0.1:8080/x"
 
 
 def test_web_allowed_domains_deny():
     from nova.tools.web import WebTools
+
     wt = WebTools(allowed_domains=["example.com"])
     with pytest.raises(ValueError):
         wt._validate_url("http://evil.example.net/x")
-

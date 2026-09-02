@@ -17,6 +17,8 @@ server = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.8",
+    "pre-commit>=3.7",
 ]
 
 # PEP 735 dependency-groups,供 `uv sync` 使用(与上方 extras 内容一致,保持同步)
@@ -28,6 +30,8 @@ server = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.8",
+    "pre-commit>=3.7",
 ]
 
 [project.scripts]
@@ -49,3 +53,29 @@ testpaths = ["tests"]
 default-groups = ["server", "dev"]
 # 缓存放到数据盘,避免与 /home 跨文件系统导致 hardlink 退化为 copy
 cache-dir = "/data/.uv-cache"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["nova", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "EXE", "PERF"]
+
+# Deliberate design choices noted here so future contributors know they're
+# intentional: broad `Exception` catches that turn tool/provider/planner
+# failures into observations/logs ("never crash the loop"). The bandit ("S")
+# ruleset is intentionally excluded — it flags in-test asserts (S101), the
+# parameterized SQLite queries (S608) and the non-crypto md5 feature hash
+# (S324) as issues, all of which are deliberate in this codebase.
+[tool.ruff.lint.per-file-ignores]
+"nova/tools/base.py" = ["BLE001"]
+"nova/http_client.py" = ["S110", "BLE001"]
+"nova/agent/team.py" = ["BLE001"]
+"nova/web/server.py" = ["BLE001"]
+"scripts/*.py" = ["BLE001"]
+# dev-only repro script: the long lines live inside embedded JS string literals
+"scripts/browser_repro.py" = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"

@@ -19,7 +19,7 @@ class MockProvider:
         self._queue: list[LLMResponse] = []
         self.calls: list[list[Message]] = []
 
-    def enqueue(self, *responses: LLMResponse) -> "MockProvider":
+    def enqueue(self, *responses: LLMResponse) -> MockProvider:
         self._queue.extend(responses)
         return self
 

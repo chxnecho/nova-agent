@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 
 @dataclass
 class ToolCall:
     """A tool invocation requested by the model."""
+
     id: str
     name: str
     arguments: dict[str, Any]
 
     @classmethod
-    def from_raw(cls, raw: dict[str, Any]) -> "ToolCall":
+    def from_raw(cls, raw: dict[str, Any]) -> ToolCall:
         args = raw.get("function", {}).get("arguments", "{}")
         try:
             parsed = json.loads(args) if isinstance(args, str) else dict(args)
@@ -37,7 +39,7 @@ class Usage:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
-    def __add__(self, other: "Usage") -> "Usage":
+    def __add__(self, other: Usage) -> Usage:
         return Usage(
             self.prompt_tokens + other.prompt_tokens,
             self.completion_tokens + other.completion_tokens,
@@ -47,12 +49,13 @@ class Usage:
 @dataclass
 class Message:
     """A chat message. role in {system, user, assistant, tool}."""
+
     role: str
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
-    tool_call_id: str | None = None   # for role == "tool"
-    name: str | None = None           # tool name for role == "tool"
-    reasoning: str | None = None      # chain-of-thought from reasoning models (not sent back)
+    tool_call_id: str | None = None  # for role == "tool"
+    name: str | None = None  # tool name for role == "tool"
+    reasoning: str | None = None  # chain-of-thought from reasoning models (not sent back)
 
     def to_api(self) -> dict[str, Any]:
         msg: dict[str, Any] = {"role": self.role}
@@ -63,7 +66,10 @@ class Message:
                 {
                     "id": tc.id,
                     "type": "function",
-                    "function": {"name": tc.name, "arguments": json.dumps(tc.arguments, ensure_ascii=False)},
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                    },
                 }
                 for tc in self.tool_calls
             ]

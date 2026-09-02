@@ -40,20 +40,21 @@ class NoCacheStaticFiles(StaticFiles):
         resp.headers["Cache-Control"] = "no-cache"
         return resp
 
+
 HEARTBEAT_SECONDS = 15.0
-SERVER_VERSION = "v9"   # surfaced via /api/sessions so stale processes are detectable
+SERVER_VERSION = "v9"  # surfaced via /api/sessions so stale processes are detectable
 
 
 class ChatBody(BaseModel):
     message: str
-    confirm_dangerous: bool = False   # ask the user before dangerous tools run
+    confirm_dangerous: bool = False  # ask the user before dangerous tools run
 
 
 class ChatRun:
     """One agent execution whose events are buffered for (re)streaming."""
 
     def __init__(self):
-        self.events: list[str] = []      # serialized SSE payloads
+        self.events: list[str] = []  # serialized SSE payloads
         self.done = False
         self.notify = asyncio.Event()
         self.stop_requested = False
@@ -67,7 +68,7 @@ class ChatRun:
 
     def mark_done(self) -> None:
         self.finished_at = time.monotonic()
-        self.emit({"type": "done"})   # terminal event for clients
+        self.emit({"type": "done"})  # terminal event for clients
         self.done = True
         self.notify.set()
 
@@ -86,9 +87,10 @@ class Session:
         self.active_run: ChatRun | None = None
         self.last_used = time.monotonic()
 
-SESSION_IDLE_TTL = 3600.0      # discard idle sessions after 1 h
-RUN_RETENTION = 600.0          # keep a finished run's event buffer for 10 min
-MAX_SESSIONS = 200             # hard cap; oldest idle sessions are evicted
+
+SESSION_IDLE_TTL = 3600.0  # discard idle sessions after 1 h
+RUN_RETENTION = 600.0  # keep a finished run's event buffer for 10 min
+MAX_SESSIONS = 200  # hard cap; oldest idle sessions are evicted
 
 
 def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAPI:
@@ -106,7 +108,7 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
         if request.headers.get("authorization", "") != f"Bearer {api_token}":
             raise HTTPException(401, "unauthorized: set Authorization: Bearer <token>")
 
-    app.state.sessions = {}                # exposed for tests/debugging
+    app.state.sessions = {}  # exposed for tests/debugging
     sessions: dict[str, Session] = app.state.sessions
     app.mount("/static", NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -135,10 +137,9 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
                 bucket = [float(RATE_LIMIT_PER_MIN), now]
                 buckets[ip] = bucket
             if bucket[0] <= 0:
-                return JSONResponse({"detail": "rate limit exceeded"},
-                                    status_code=429)
+                return JSONResponse({"detail": "rate limit exceeded"}, status_code=429)
             bucket[0] -= 1
-            if len(buckets) > 4096:          # bound memory
+            if len(buckets) > 4096:  # bound memory
                 buckets.pop(next(iter(buckets)), None)
         return await call_next(request)
 
@@ -162,6 +163,7 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
     async def janitor() -> None:
         """Periodically reap expired sessions/runs so long-running servers
         don't leak memory."""
+
         async def _loop():
             while True:
                 await asyncio.sleep(60)
@@ -174,15 +176,20 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
                             del s.runs[rid]
                             if s.active_run is r:
                                 s.active_run = None
-                    if (not s.running and s.active_run is None
-                            and now - s.last_used > SESSION_IDLE_TTL):
+                    if (
+                        not s.running
+                        and s.active_run is None
+                        and now - s.last_used > SESSION_IDLE_TTL
+                    ):
                         sessions.pop(sid, None)
                         await s.provider.aclose()
                 while len(sessions) > MAX_SESSIONS:
                     oldest = min(sessions, key=lambda k: sessions[k].last_used)
                     s = sessions.pop(oldest)
                     await s.provider.aclose()
-        asyncio.create_task(_loop())
+
+        asyncio.create_task(_loop())  # noqa: RUF006 - task lives for process lifetime
+        app.state.janitor_tasks = []  # store-a-reference hook (see above)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -192,9 +199,11 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
     async def new_session():
         sid = uuid.uuid4().hex[:12]
         sessions[sid] = Session(cfg, workspace=workspace)
-        return {"session_id": sid,
-                "model": getattr(sessions[sid].provider, "model", "mock"),
-                "server_version": SERVER_VERSION}
+        return {
+            "session_id": sid,
+            "model": getattr(sessions[sid].provider, "model", "mock"),
+            "server_version": SERVER_VERSION,
+        }
 
     @app.post("/api/chat/{sid}")
     async def chat(sid: str, body: ChatBody):
@@ -215,42 +224,48 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
             agent = session.agent
             run_started_at = time.monotonic()
             try:
-                agent.stream_callback = lambda d: run.emit(
-                    {"type": "delta", "text": d})
-                agent.reasoning_callback = lambda d: run.emit(
-                    {"type": "reasoning", "text": d})
+                agent.stream_callback = lambda d: run.emit({"type": "delta", "text": d})
+                agent.reasoning_callback = lambda d: run.emit({"type": "reasoning", "text": d})
                 if body.confirm_dangerous:
+
                     async def approve(tool_name: str, args: dict) -> bool:
                         run.approved = False
                         run.approval_event = asyncio.Event()
-                        run.emit({"type": "approval_request",
-                                  "tool": tool_name, "args": args})
+                        run.emit({"type": "approval_request", "tool": tool_name, "args": args})
                         await run.approval_event.wait()
                         return run.approved
+
                     agent.approval_callback = approve
                 else:
                     agent.approval_callback = None
 
                 def on_step(step) -> None:
-                    run.emit({
-                        "type": "step", "kind": step.kind, "step": step.step,
-                        "content": (step.content or "")[:2500],
-                        "tool": step.tool_name, "args": step.tool_args,
-                        "observation": (step.observation or "")[:1800],
-                    })
+                    run.emit(
+                        {
+                            "type": "step",
+                            "kind": step.kind,
+                            "step": step.step,
+                            "content": (step.content or "")[:2500],
+                            "tool": step.tool_name,
+                            "args": step.tool_args,
+                            "observation": (step.observation or "")[:1800],
+                        }
+                    )
+
                 agent.on_step = on_step
 
-                result = await agent.run(body.message,
-                                         should_stop=lambda: run.stop_requested)
-                run.emit({
-                    "type": "final",
-                    "text": result.final_answer,
-                    "steps": result.steps_used,
-                    "tokens": result.prompt_tokens + result.completion_tokens,
-                    "reason": result.stopped_reason,
-                    "cost_usd": round(result.cost_usd, 4),
-                    "duration_s": round(time.monotonic() - run_started_at, 1),
-                })
+                result = await agent.run(body.message, should_stop=lambda: run.stop_requested)
+                run.emit(
+                    {
+                        "type": "final",
+                        "text": result.final_answer,
+                        "steps": result.steps_used,
+                        "tokens": result.prompt_tokens + result.completion_tokens,
+                        "reason": result.stopped_reason,
+                        "cost_usd": round(result.cost_usd, 4),
+                        "duration_s": round(time.monotonic() - run_started_at, 1),
+                    }
+                )
             except Exception as exc:
                 run.emit({"type": "error", "message": str(exc)})
             finally:
@@ -282,16 +297,20 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
                 if run.done:
                     return
                 try:
-                    await asyncio.wait_for(run.notify.wait(),
-                                           timeout=HEARTBEAT_SECONDS)
-                except asyncio.TimeoutError:
-                    yield ": hb\n\n"          # keep intermediaries from timing out
+                    await asyncio.wait_for(run.notify.wait(), timeout=HEARTBEAT_SECONDS)
+                except TimeoutError:
+                    yield ": hb\n\n"  # keep intermediaries from timing out
                 run.notify.clear()
 
         return StreamingResponse(
-            event_stream(), media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                     "Connection": "keep-alive"})
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
 
     @app.get("/api/events/{sid}/{rid}")
     async def events(sid: str, rid: str, after: int = 0):
@@ -300,7 +319,7 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
         if session is None or rid not in session.runs:
             raise HTTPException(404, "unknown session or run")
         run = session.runs[rid]
-        batch = [json.loads(e) for e in run.events[max(after, 0):]]
+        batch = [json.loads(e) for e in run.events[max(after, 0) :]]
         return {"events": batch, "done": run.done}
 
     @app.post("/api/stop/{sid}")
@@ -334,7 +353,7 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
         if session is None:
             raise HTTPException(404, "unknown session")
         if session.active_run is not None:
-            session.active_run.stop_requested = True   # stop work before discarding
+            session.active_run.stop_requested = True  # stop work before discarding
         return {"ok": True}
 
     @app.get("/api/stats/{sid}")
@@ -344,9 +363,12 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
             raise HTTPException(404, "unknown session")
         u = session.provider.total_usage
         model = getattr(session.provider, "model", "mock")
-        return {"model": model, "prompt_tokens": u.prompt_tokens,
-                "completion_tokens": u.completion_tokens,
-                "total_tokens": u.total_tokens}
+        return {
+            "model": model,
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "total_tokens": u.total_tokens,
+        }
 
     @app.get("/api/history/{sid}")
     async def history(sid: str):

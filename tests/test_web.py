@@ -1,23 +1,32 @@
 import json
 
 from fastapi.testclient import TestClient
-
 from nova.config import Config
 from nova.llm.base import LLMResponse, Message, Usage
-from nova.llm.mock import MockProvider
 from nova.web.server import create_app
 
 
 def resp_text(text):
-    return LLMResponse(message=Message(role="assistant", content=text),
-                       usage=Usage(10, 5), model="mock", finish_reason="stop")
+    return LLMResponse(
+        message=Message(role="assistant", content=text),
+        usage=Usage(10, 5),
+        model="mock",
+        finish_reason="stop",
+    )
 
 
 def make_app():
-    cfg = Config({"llm": {"provider": "mock"}, "memory": {"enabled": False},
-                  "tools": {"shell": {"enabled": False},
-                            "python_repl": {"enabled": False},
-                            "web": {"enabled": False}}})
+    cfg = Config(
+        {
+            "llm": {"provider": "mock"},
+            "memory": {"enabled": False},
+            "tools": {
+                "shell": {"enabled": False},
+                "python_repl": {"enabled": False},
+                "web": {"enabled": False},
+            },
+        }
+    )
     return create_app(cfg)
 
 
@@ -29,8 +38,10 @@ def test_auth_required_when_token_set(monkeypatch):
     client = TestClient(app)
 
     assert client.get("/api/history/nope").status_code == 401
-    assert (client.get("/api/history/nope",
-                       headers={"Authorization": "Bearer wrong"}).status_code == 401)
+    assert (
+        client.get("/api/history/nope", headers={"Authorization": "Bearer wrong"}).status_code
+        == 401
+    )
     # page itself is still public so the browser can render the UI
     assert client.get("/").status_code == 200
     # correct token passes through to normal handling (404: unknown session)
@@ -42,7 +53,7 @@ def test_no_auth_when_token_unset(monkeypatch):
     monkeypatch.delenv("NOVA_WEB_TOKEN", raising=False)
     client = TestClient(make_app())
     r = client.get("/api/history/nope")
-    assert r.status_code == 404          # reaches handler: unknown session, not 401
+    assert r.status_code == 404  # reaches handler: unknown session, not 401
 
 
 def test_index_page_served():
@@ -65,6 +76,7 @@ def test_chat_stream_end_to_end():
 
     # give the background task a moment, then replay the event buffer
     import time
+
     for _ in range(50):
         if sessions_of(client)[sid].runs[run_id].done:
             break
@@ -74,13 +86,10 @@ def test_chat_stream_end_to_end():
     assert r2.status_code == 200
     assert r2.headers["content-type"].startswith("text/event-stream")
 
-    events = []
-    for line in r2.text.splitlines():
-        if line.startswith("data: "):
-            events.append(json.loads(line[6:]))
+    events = [json.loads(line[6:]) for line in r2.text.splitlines() if line.startswith("data: ")]
     kinds = [e["type"] for e in events]
     assert "final" in kinds
-    final = [e for e in events if e["type"] == "final"][0]
+    final = next(e for e in events if e["type"] == "final")
     assert "[mock] You said: hello agent" in final["text"]
     assert kinds[-1] == "done"
 
@@ -95,6 +104,7 @@ def test_stream_replay_is_stable():
     app = make_app()
     client = TestClient(app)
     import time
+
     sid = client.post("/api/sessions").json()["session_id"]
     rid = client.post(f"/api/chat/{sid}", json={"message": "hi"}).json()["run_id"]
     for _ in range(50):
@@ -136,6 +146,7 @@ def test_events_polling_endpoint():
     app = make_app()
     client = TestClient(app)
     import time
+
     sid = client.post("/api/sessions").json()["session_id"]
     rid = client.post(f"/api/chat/{sid}", json={"message": "poll me"}).json()["run_id"]
     for _ in range(50):

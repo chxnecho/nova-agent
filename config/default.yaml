@@ -14,6 +14,7 @@ llm:
 agent:
   max_steps: 40                 # hard cap on think-act iterations per run
   max_cost_usd: 2.0             # budget guard per run
+  cost_per_mtok: [0.3, 1.2]     # (prompt, completion) USD per 1M tokens for the budget guard
   reflect_on_error: true        # enable self-reflection after tool failures
   max_consecutive_errors: 0     # stop after this many tools fail in a row (0 = off)
   system_prompt_file: null      # optional path to a custom system prompt
