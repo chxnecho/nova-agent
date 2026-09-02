@@ -166,6 +166,22 @@ def test_events_polling_endpoint():
     assert r.status_code == 404
 
 
+def test_lifespan_startup_shutdown_hygiene():
+    """On TestClient context entry the janitor starts; on exit it is cancelled
+    and every session's provider is closed (no open clients are left behind)."""
+    app = make_app()
+    client = TestClient(app)
+    sid = None
+    with client:
+        assert not app.state.janitor_task.done()
+        sid = client.post("/api/sessions").json()["session_id"]
+        assert len(app.state.sessions) == 1
+    # shutdown ran: sessions drained, provider closed, janitor cancelled
+    assert len(app.state.sessions) == 0
+    assert app.state.janitor_task.done()
+    assert sid is not None
+
+
 def test_delete_session_endpoint():
     app = make_app()
     client = TestClient(app)

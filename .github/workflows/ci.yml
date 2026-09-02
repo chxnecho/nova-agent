@@ -34,5 +34,13 @@ jobs:
       - name: Format check
         run: uv run ruff format --check .
 
-      - name: Test
+      - name: Test (Python)
         run: uv run pytest tests/ -q
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test (frontend markdown module)
+        run: node --test

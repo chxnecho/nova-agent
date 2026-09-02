@@ -83,10 +83,33 @@ class MemoryStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            # In-memory vector index: {id: (text, kind, source, created_at, emb)}.
+            # Search runs entirely against this index so it never re-reads or
+            # re-parses every row's JSON embedding on each query.
+            self._index = self._load_index()
 
     def _acquire(self) -> sqlite3.Connection:
         """Context-style helper: returns the shared connection under the lock."""
         return self._conn
+
+    def _load_index(self) -> dict[int, tuple[str, str, str | None, float, list[float]]]:
+        idx: dict[int, tuple[str, str, str | None, float, list[float]]] = {}
+        with self._acquire() as c:
+            sql = "SELECT id, text, kind, source, created_at, embedding FROM memories"
+            for row in c.execute(sql):
+                idx[row["id"]] = (
+                    row["text"],
+                    row["kind"],
+                    row["source"],
+                    row["created_at"],
+                    json.loads(row["embedding"]),
+                )
+        return idx
+
+    def _count_db(self) -> int:
+        """Fast DB-side row count, used as a staleness check for the index."""
+        with self._acquire() as c:
+            return int(c.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"])
 
     # ------------------------------------------------------------------ #
 
@@ -95,14 +118,17 @@ class MemoryStore:
         if not text:
             raise ValueError("cannot store empty memory")
         emb = self.embedder.embed(text)
+        created_at = time.time()
         with self._lock, self._acquire() as c:
             cur = c.execute(
                 "INSERT INTO memories (text, kind, source, created_at, dim, embedding) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (text, kind, source, time.time(), len(emb), json.dumps(emb)),
+                (text, kind, source, created_at, len(emb), json.dumps(emb)),
             )
-            log.debug("stored memory #%d (%s, %d chars)", cur.lastrowid, kind, len(text))
-            return int(cur.lastrowid)
+            mid = int(cur.lastrowid)
+            self._index[mid] = (text, kind, source, created_at, emb)
+            log.debug("stored memory #%d (%s, %d chars)", mid, kind, len(text))
+            return mid
 
     def add_document(self, text: str, source: str, max_chars: int = 800) -> int:
         """Chunk a document and store every chunk; returns number of chunks stored."""
@@ -113,20 +139,23 @@ class MemoryStore:
 
     def search(self, query: str, top_k: int = 5, kind: str | None = None) -> list[MemoryRecord]:
         qemb = self.embedder.embed(query)
-        sql = "SELECT * FROM memories" + (" WHERE kind = ?" if kind else "")
-        params = (kind,) if kind else ()
         scored: list[MemoryRecord] = []
-        with self._lock, self._acquire() as c:
-            for row in c.execute(sql, params):
-                emb = json.loads(row["embedding"])
+        with self._lock:
+            # cheap consistency guard: if another process/instance wrote to the
+            # same DB file, our in-memory index is stale — reload it once.
+            if self._count_db() != len(self._index):
+                self._index = self._load_index()
+            for mid, (text, mkind, source, created_at, emb) in self._index.items():
+                if kind and mkind != kind:
+                    continue
                 score = cosine(qemb, emb)
                 scored.append(
                     MemoryRecord(
-                        id=row["id"],
-                        text=row["text"],
-                        kind=row["kind"],
-                        source=row["source"],
-                        created_at=row["created_at"],
+                        id=mid,
+                        text=text,
+                        kind=mkind,
+                        source=source,
+                        created_at=created_at,
                         score=score,
                     )
                 )
@@ -136,7 +165,10 @@ class MemoryStore:
     def delete(self, memory_id: int) -> bool:
         with self._lock, self._acquire() as c:
             cur = c.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-            return cur.rowcount > 0
+            if cur.rowcount > 0:
+                self._index.pop(memory_id, None)
+                return True
+            return False
 
     def count(self, kind: str | None = None) -> int:
         sql = "SELECT COUNT(*) AS n FROM memories" + (" WHERE kind = ?" if kind else "")

@@ -17,6 +17,7 @@ import json
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -93,9 +94,57 @@ RUN_RETENTION = 600.0  # keep a finished run's event buffer for 10 min
 MAX_SESSIONS = 200  # hard cap; oldest idle sessions are evicted
 
 
+def _build_lifespan(sessions: dict[str, Session]):
+    """FastAPI lifespan: start the session janitor on startup and tear down
+    (cancel the janitor + close every provider) on shutdown.
+    """
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async def _loop() -> None:
+            while True:
+                await asyncio.sleep(60)
+                now = time.monotonic()
+                for sid in list(sessions):
+                    s = sessions[sid]
+                    for rid in list(s.runs):
+                        r = s.runs[rid]
+                        if r.done and now - getattr(r, "finished_at", now) > RUN_RETENTION:
+                            del s.runs[rid]
+                            if s.active_run is r:
+                                s.active_run = None
+                    if (
+                        not s.running
+                        and s.active_run is None
+                        and now - s.last_used > SESSION_IDLE_TTL
+                    ):
+                        sessions.pop(sid, None)
+                        await s.provider.aclose()
+                while len(sessions) > MAX_SESSIONS:
+                    oldest = min(sessions, key=lambda k: sessions[k].last_used)
+                    s = sessions.pop(oldest)
+                    await s.provider.aclose()
+
+        task = asyncio.create_task(_loop())
+        app.state.janitor_task = task  # keep a reference so it isn't GC'd
+        try:
+            yield
+        finally:
+            task.cancel()
+            # shutdown hygiene: close every remaining provider/client
+            for sid in list(sessions):
+                s = sessions.pop(sid, None)
+                if s is not None:
+                    await s.provider.aclose()
+
+    return lifespan
+
+
 def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAPI:
     cfg = cfg or load_config()
-    app = FastAPI(title="NovaAgent")
+    sessions: dict[str, Session] = {}
+    app = FastAPI(title="NovaAgent", lifespan=_build_lifespan(sessions))
+    app.state.sessions = sessions
 
     # Optional bearer-token auth for every /api endpoint (enable by setting
     # NOVA_WEB_TOKEN or server.auth_token). The page and static assets stay
@@ -108,8 +157,6 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
         if request.headers.get("authorization", "") != f"Bearer {api_token}":
             raise HTTPException(401, "unauthorized: set Authorization: Bearer <token>")
 
-    app.state.sessions = {}  # exposed for tests/debugging
-    sessions: dict[str, Session] = app.state.sessions
     app.mount("/static", NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")
 
     @app.middleware("http")
@@ -158,38 +205,6 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
             "base-uri 'self'; form-action 'self'",
         )
         return resp
-
-    @app.on_event("startup")
-    async def janitor() -> None:
-        """Periodically reap expired sessions/runs so long-running servers
-        don't leak memory."""
-
-        async def _loop():
-            while True:
-                await asyncio.sleep(60)
-                now = time.monotonic()
-                for sid in list(sessions):
-                    s = sessions[sid]
-                    for rid in list(s.runs):
-                        r = s.runs[rid]
-                        if r.done and now - getattr(r, "finished_at", now) > RUN_RETENTION:
-                            del s.runs[rid]
-                            if s.active_run is r:
-                                s.active_run = None
-                    if (
-                        not s.running
-                        and s.active_run is None
-                        and now - s.last_used > SESSION_IDLE_TTL
-                    ):
-                        sessions.pop(sid, None)
-                        await s.provider.aclose()
-                while len(sessions) > MAX_SESSIONS:
-                    oldest = min(sessions, key=lambda k: sessions[k].last_used)
-                    s = sessions.pop(oldest)
-                    await s.provider.aclose()
-
-        asyncio.create_task(_loop())  # noqa: RUF006 - task lives for process lifetime
-        app.state.janitor_tasks = []  # store-a-reference hook (see above)
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:

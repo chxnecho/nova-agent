@@ -23,6 +23,11 @@ class MockProvider:
         self._queue.extend(responses)
         return self
 
+    async def aclose(self) -> None:
+        """No-op: mock has no network client to close (keeps the provider
+        interface uniform with OpenAICompatibleProvider)."""
+        return None
+
     async def chat(
         self,
         messages: list[Message],
