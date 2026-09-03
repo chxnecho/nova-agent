@@ -166,6 +166,29 @@ def test_events_polling_endpoint():
     assert r.status_code == 404
 
 
+def test_rate_limit_disabled_when_zero():
+    """rate_limit_per_minute:0 semantics: disabled (not 'deny everything')."""
+    app = create_app(
+        Config(
+            {
+                "llm": {"provider": "mock"},
+                "memory": {"enabled": False},
+                "tools": {
+                    "shell": {"enabled": False},
+                    "python_repl": {"enabled": False},
+                    "web": {"enabled": False},
+                },
+                "server": {"rate_limit_per_minute": 0},
+            }
+        )
+    )
+    with TestClient(app) as client:
+        # all requests pass through even though the limit is set to "0"
+        for _ in range(10):
+            r = client.get("/api/history/nope")
+            assert r.status_code == 404  # reached handler; not a 429
+
+
 def test_lifespan_startup_shutdown_hygiene():
     """On TestClient context entry the janitor starts; on exit it is cancelled
     and every session's provider is closed (no open clients are left behind)."""

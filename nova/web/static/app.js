@@ -6,7 +6,7 @@ const input = $("input"), sendBtn = $("sendBtn");
 const pill = $("statusPill"), modelInfo = $("modelInfo"), tokenInfo = $("tokenInfo");
 const convoList = $("convoList"), convTitle = $("convTitle");
 const verInfo = $("verInfo"), runStatusEl = $("runStatus");
-const UI_VERSION = "v14-ux";
+const UI_VERSION = "v15";
 
 // Pure content/markdown helpers live in markdown.js (loaded first) so they can
 // be unit-tested under node; they're exposed on window as NovaMarkdown.

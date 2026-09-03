@@ -123,8 +123,14 @@ def load_config(config_path: Path | None = None) -> Config:
 
 
 def api_key_for(cfg: Config) -> str:
-    """Resolve the API key from env based on the configured provider."""
+    """Resolve the API key from env based on the configured provider.
+
+    The `mock` provider needs no key at all — return "" so the offline
+    mode works from the CLI (run/team/chat) without any API key set.
+    """
     provider = cfg.get("llm.provider", "openrouter")
+    if provider == "mock":
+        return ""
     candidates = {
         "openrouter": ["OPENROUTER_API_KEY"],
         "openai-compatible": ["OPENAI_API_KEY", "OPENROUTER_API_KEY"],

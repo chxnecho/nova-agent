@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -56,11 +57,15 @@ def get_logger(name: str) -> logging.Logger:
 
 
 class JsonlTraceWriter:
-    """Append-only JSONL trace writer: one JSON object per agent step/event."""
+    """Append-only JSONL trace writer: one JSON object per agent step/event.
+
+    Thread-safe: whether the writes come from CLI or from concurrent web
+    sessions, each record is emitted as a single atomic line (locked)."""
 
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self._path = path
+        self._lock = threading.Lock()
 
     def write(self, event_type: str, payload: dict) -> None:
         record = {

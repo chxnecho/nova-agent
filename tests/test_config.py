@@ -1,6 +1,6 @@
 """Tests for nova.config."""
 
-from nova.config import Config
+from nova.config import Config, api_key_for
 
 
 def make_cfg(data):
@@ -24,3 +24,11 @@ def test_repr_hides_keys():
     r = repr(cfg)
     assert "secret" not in r
     assert "***" in r
+
+
+def test_mock_provider_needs_no_api_key(monkeypatch):
+    """Offline dev mode: llm.provider=mock must not require any API key."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfg = make_cfg({"llm": {"provider": "mock"}})
+    assert api_key_for(cfg) == ""

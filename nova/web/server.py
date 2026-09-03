@@ -43,7 +43,7 @@ class NoCacheStaticFiles(StaticFiles):
 
 
 HEARTBEAT_SECONDS = 15.0
-SERVER_VERSION = "v9"  # surfaced via /api/sessions so stale processes are detectable
+SERVER_VERSION = "v10"  # surfaced via /api/sessions so stale processes are detectable
 
 
 class ChatBody(BaseModel):
@@ -175,6 +175,8 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
 
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
+        if RATE_LIMIT_PER_MIN <= 0:  # 0 = disable (config default comment)
+            return await call_next(request)
         if request.url.path.startswith("/api"):
             ip = request.client.host if request.client else "unknown"
             buckets = app.state.rate_buckets

@@ -4,15 +4,23 @@ import httpx
 from nova.http_client import create_async_client, normalized_env_proxy
 
 
-def test_normalize_socks_scheme():
-    assert normalized_env_proxy() is None  # no env in test runner (usually)
-    import os
-
-    os.environ["ALL_PROXY"] = "socks://127.0.0.1:7897"
-    try:
-        assert normalized_env_proxy() == "socks5://127.0.0.1:7897"
-    finally:
-        del os.environ["ALL_PROXY"]
+def test_normalize_socks_scheme(monkeypatch):
+    """Clean the env first: this must not depend on whatever proxy settings
+    the developer's machine happens to have (Clash/V2Ray users etc.)."""
+    for var in (
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    assert normalized_env_proxy() is None
+    monkeypatch.setenv("ALL_PROXY", "socks://127.0.0.1:7897")
+    assert normalized_env_proxy() == "socks5://127.0.0.1:7897"
 
 
 def test_broken_proxy_env_does_not_crash(monkeypatch):

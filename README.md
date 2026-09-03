@@ -6,13 +6,13 @@
 
 | 模块 | 能力 |
 |---|---|
-| **Agent 内核** | think → act → observe 自主循环;工具调用;失败后自动反思纠错;步数/成本双预算守卫;JSONL trace 全程留痕 |
-| **LLM 抽象层** | OpenAI 兼容接口(OpenRouter/OpenAI/vLLM 等);流式 SSE 输出;指数退避重试;token 用量统计 |
-| **工具系统** | 注册表 + JSON Schema;内置 11 个工具:`read_file` / `write_file` / `edit_file` / `list_dir`(沙箱)、`run_shell`(超时+黑名单)、`python_repl`(子进程隔离)、`web_fetch`、`remember` / `recall` / `ingest_document` / `search_knowledge` |
-| **记忆 & RAG** | SQLite 向量存储 + 特征哈希嵌入(零外部依赖);文档分块索引;跨会话持久化 |
-| **多智能体** | Planner 分解任务 → 多个 Executor 依次执行 → Critic 审查,不通过则修订重试(可配轮数),最后综合报告 |
-| **Web 界面** | FastAPI + SSE 流式后端;单页聊天 UI 实时显示思考过程和每次工具调用 |
-| **CLI** | `run`(自主任务)/ `chat`(多轮交互)/ `team`(团队模式)/ `serve`(启动 Web) |
+| **Agent 内核** | think → act → observe 自主循环；工具调用；失败后自动反思纠错；步数/成本双预算守卫；连续失败守卫；长对话历史自动压缩（LLM 摘要化）；JSONL trace 全程留痕 |
+| **LLM 抽象层** | OpenAI 兼容接口（OpenRouter/OpenAI/vLLM 等）；流式 SSE 输出；指数退避重试；token 用量统计 |
+| **工具系统** | 注册表 + JSON Schema；内置 11 个工具：`read_file` / `write_file` / `edit_file` / `list_dir`（沙箱）、`run_shell`（超时+黑名单+工作区写保护）、`python_repl`（子进程隔离）、`web_fetch`（SSRF 防护+域名白名单）、`remember` / `recall` / `ingest_document` / `search_knowledge` |
+| **记忆 & RAG** | SQLite 向量存储 + 内存向量索引（查询零磁盘扫表）+ 特征哈希嵌入（零外部依赖）；文档分块索引；跨会话持久化 |
+| **多智能体** | Planner 分解任务 → 多个 Executor 依次执行 → Critic 审查，不通过则修订重试（可配轮数），最后综合报告 |
+| **Web 界面** | FastAPI + SSE 流式后端；单页聊天 UI 实时显示思考过程和每次工具调用；高危操作人工确认；每 IP 限流；Bearer 认证 + CSP 等安全头 |
+| **CLI** | `run`（自主任务）/ `chat`（多轮交互）/ `team`（团队模式）/ `serve`（启动 Web） |
 
 ## 快速开始
 
