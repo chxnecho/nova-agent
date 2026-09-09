@@ -321,6 +321,42 @@ def test_stop_releases_pending_approval():
         assert final["type"] == "final" and final["reason"] == "user_stopped"
 
 
+def test_host_guard_blocks_rebinding_domain():
+    """DNS-rebinding defense: a public *domain* Host header is rejected while
+    loopback/private IPs, localhost and single-label names pass through."""
+    client = TestClient(make_app())
+    # rebinding-style request: domain Host header -> 403 on API and page alike
+    assert client.get("/api/history/nope", headers={"Host": "evil.com"}).status_code == 403
+    assert client.get("/", headers={"Host": "evil.com"}).status_code == 403
+    # legitimate local access patterns pass
+    assert client.get("/", headers={"Host": "localhost:8321"}).status_code == 200
+    assert client.get("/", headers={"Host": "127.0.0.1:8321"}).status_code == 200
+    assert client.get("/", headers={"Host": "192.168.1.5:8321"}).status_code == 200
+    # default TestClient host ("testserver", single label) keeps working
+    assert client.get("/").status_code == 200
+
+
+def test_host_guard_allows_configured_domain():
+    app = create_app(
+        Config(
+            {
+                "llm": {"provider": "mock"},
+                "memory": {"enabled": False},
+                "tools": {
+                    "shell": {"enabled": False},
+                    "python_repl": {"enabled": False},
+                    "web": {"enabled": False},
+                },
+                "server": {"allowed_hosts": ["nova.example.com"]},
+            }
+        )
+    )
+    client = TestClient(app)
+    r = client.get("/api/history/nope", headers={"Host": "nova.example.com"})
+    assert r.status_code == 404  # passed the guard; unknown session
+    assert client.get("/api/history/nope", headers={"Host": "other.com"}).status_code == 403
+
+
 def test_lifespan_startup_shutdown_hygiene():
     """On TestClient context entry the janitor starts; on exit it is cancelled
     and every session's provider is closed (no open clients are left behind)."""

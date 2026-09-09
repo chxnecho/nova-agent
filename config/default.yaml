@@ -48,6 +48,8 @@ server:
   port: 8321
   rate_limit_per_minute: 300      # per-IP cap for every /api/* request (0 disables)
   approval_timeout_seconds: 300   # dangerous-tool approvals wait at most this long
+  allowed_hosts: null             # extra Host headers to accept, e.g. [nova.example.com];
+                                  # loopback/private IPs & single-label names are always allowed
 
 logging:
   level: INFO

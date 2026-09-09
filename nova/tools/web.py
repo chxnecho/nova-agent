@@ -7,7 +7,9 @@ import html
 import ipaddress
 import re
 import socket
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import httpx
 
 from nova.http_client import create_async_client
 from nova.tools.base import tool
@@ -25,9 +27,15 @@ class WebTools:
     each hop. An optional hostname allow-list can be supplied via config.
     """
 
-    def __init__(self, allow_private: bool = False, allowed_domains: list[str] | None = None):
+    def __init__(
+        self,
+        allow_private: bool = False,
+        allowed_domains: list[str] | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
         self.allow_private = allow_private
         self.allowed_domains = allowed_domains or []
+        self.transport = transport  # test hook: e.g. httpx.MockTransport
 
     def register(self, registry) -> None:
         registry.register(
@@ -82,21 +90,70 @@ class WebTools:
             + (f"?{parsed.query}" if parsed.query else "")
         )
 
+    def _resolve_pin(self, raw: str) -> tuple[str, str]:
+        """Resolve `raw`'s hostname and pin the request to a public IP.
+
+        Returns (pinned_url, original_hostname). EVERY resolved address must
+        be public, so a multi-record DNS rebinding can't smuggle a private
+        target through between validation and connection. The returned URL
+        has its hostname replaced by the IP; the caller keeps the original
+        hostname in the Host header (and SNI for https).
+        """
+        parsed = urlparse(raw)
+        host = parsed.hostname or ""
+        port = parsed.port
+        infos = socket.getaddrinfo(host, port)
+        ips = {info[4][0] for info in infos}
+        public: str | None = None
+        for ip in ips:
+            addr = ipaddress.ip_address(ip)
+            if (
+                addr.is_private
+                or addr.is_loopback
+                or addr.is_link_local
+                or addr.is_reserved
+                or addr.is_multicast
+                or addr.is_unspecified
+            ):
+                raise ValueError(
+                    f"hostname '{host}' resolves to non-public address {ip}; "
+                    "blocked by the SSRF guard"
+                )
+            public = public or ip
+        if public is None:
+            raise ValueError(f"hostname '{host}' did not resolve")
+        host_for_url = f"[{public}]" if ":" in public else public
+        netloc = host_for_url + (f":{port}" if port else "")
+        pinned = urlunparse((parsed.scheme, netloc, parsed.path or "/", "", parsed.query, ""))
+        return pinned, host
+
     async def fetch(self, url: str, max_chars: int | None = None) -> str:
         limit = min(max_chars or MAX_CONTENT, MAX_CONTENT)
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; NovaAgent/0.1)"}
+        base_headers = {"User-Agent": "Mozilla/5.0 (compatible; NovaAgent/0.1)"}
         try:
-            # _validate_url does a blocking getaddrinfo — keep it off the loop
+            # scheme/allow-list checks (also does a blocking getaddrinfo —
+            # keep it off the event loop)
             target = await asyncio.to_thread(self._validate_url, url)
         except ValueError as exc:
             return f"ERROR: {exc}"
 
-        # follow redirects ourselves so every hop is re-validated against SSRF
+        # follow redirects ourselves: every hop gets scheme/allow-list checks
+        # AND a fresh IP pin, closing the resolve-then-connect (TOCTOU) gap
         for _ in range(_MAX_REDIRECTS + 1):
-            async with create_async_client(
-                headers=headers, timeout=_TIMEOUT, follow_redirects=False
-            ) as c:
-                resp = await c.get(target)
+            try:
+                target, host = await asyncio.to_thread(self._resolve_pin, target)
+            except (ValueError, socket.gaierror) as exc:
+                return f"ERROR: {exc}"
+            req_headers = {**base_headers, "Host": host}
+            ext = {"sni_hostname": host} if target.startswith("https://") else {}
+
+            client_kwargs = dict(headers=req_headers, timeout=_TIMEOUT, follow_redirects=False)
+            if self.transport is not None:  # test hook: bypass proxy handling
+                client = httpx.AsyncClient(transport=self.transport, **client_kwargs)
+            else:
+                client = create_async_client(**client_kwargs)
+            async with client as c:
+                resp = await c.get(target, extensions=ext)
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("location")
                 if not loc:

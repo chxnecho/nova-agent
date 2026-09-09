@@ -34,6 +34,9 @@ jobs:
       - name: Format check
         run: uv run ruff format --check .
 
+      - name: Lockfile check
+        run: uv lock --check
+
       - name: Test (Python)
         run: uv run pytest tests/ -q
 

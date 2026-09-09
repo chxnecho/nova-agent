@@ -13,6 +13,7 @@ UI can never miss the final answer or get stuck in a busy state.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import time
@@ -159,6 +160,46 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
             raise HTTPException(401, "unauthorized: set Authorization: Bearer <token>")
 
     app.mount("/static", NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    # ---- Host-header guard (DNS-rebinding defense) ----
+    # A rebinding domain resolves to 127.0.0.1 while the browser still sends
+    # the attacker's *domain* as the Host header. Accepting that would give a
+    # malicious page same-origin access to this service. Default policy:
+    #   - allow loopback / private / link-local IP literals and localhost
+    #   - allow single-label hostnames (localhost, container/service names)
+    #   - allow hosts listed in server.allowed_hosts (extra domains)
+    #   - reject everything else (e.g. a public domain rebinding to loopback)
+    allowed_hosts_extra = {
+        h.strip().lower()
+        for h in (cfg.get("server.allowed_hosts") or [])
+        if isinstance(h, str) and h.strip()
+    }
+
+    def host_allowed(request: Request) -> bool:
+        raw = (request.headers.get("host") or "").strip()
+        if not raw:
+            return True  # HTTP/1.0-style request without a Host header
+        hostname = raw.rsplit(":", 1)[0].strip("[]").lower()
+        if not hostname:
+            return True
+        try:
+            addr = ipaddress.ip_address(hostname)
+            if addr.is_loopback or addr.is_private or addr.is_link_local:
+                return True
+        except ValueError:
+            pass
+        if hostname == "localhost" or "." not in hostname:
+            return True  # loopback name or single-label service name
+        return hostname in allowed_hosts_extra
+
+    @app.middleware("http")
+    async def host_guard_middleware(request: Request, call_next):
+        if not host_allowed(request):
+            return JSONResponse(
+                {"detail": f"untrusted Host header: {request.headers.get('host', '')}"},
+                status_code=403,
+            )
+        return await call_next(request)
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):

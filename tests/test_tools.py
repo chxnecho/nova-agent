@@ -122,3 +122,59 @@ def test_web_allowed_domains_deny():
     wt = WebTools(allowed_domains=["example.com"])
     with pytest.raises(ValueError):
         wt._validate_url("http://evil.example.net/x")
+
+
+def test_fetch_pins_ip_and_keeps_host(monkeypatch):
+    """The request must go to the *resolved IP* while keeping the original
+    hostname in the Host header — closing the resolve-then-connect race."""
+    import socket
+
+    import httpx
+
+    captured = {}
+
+    def fake_getaddrinfo(host, port, *a, **kw):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["host_header"] = request.headers.get("host")
+        return httpx.Response(200, text="pinned-ok")
+
+    from nova.tools.web import WebTools
+
+    wt = WebTools(transport=httpx.MockTransport(handler))
+    out = asyncio.run(wt.fetch("http://example.com/hello"))
+
+    assert "pinned-ok" in out
+    assert captured["url"].startswith("http://93.184.216.34/hello")
+    assert captured["host_header"] == "example.com"
+
+
+def test_fetch_rejects_multi_record_rebinding(monkeypatch):
+    """A hostname resolving to one public + one private address is rejected:
+    both records must be public (multi-record rebinding defense)."""
+    import socket
+
+    import httpx
+
+    def fake_getaddrinfo(host, port, *a, **kw):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.1", port or 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    from nova.tools.web import WebTools
+
+    wt = WebTools(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text="should not get here")
+        )
+    )
+    out = asyncio.run(wt.fetch("http://rebind.example/hello"))
+    assert out.startswith("ERROR:")
+    assert "private" in out  # rejected at entry validation or at the pin step
