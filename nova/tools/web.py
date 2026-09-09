@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import ipaddress
 import re
@@ -85,7 +86,8 @@ class WebTools:
         limit = min(max_chars or MAX_CONTENT, MAX_CONTENT)
         headers = {"User-Agent": "Mozilla/5.0 (compatible; NovaAgent/0.1)"}
         try:
-            target = self._validate_url(url)
+            # _validate_url does a blocking getaddrinfo — keep it off the loop
+            target = await asyncio.to_thread(self._validate_url, url)
         except ValueError as exc:
             return f"ERROR: {exc}"
 
@@ -100,7 +102,7 @@ class WebTools:
                 if not loc:
                     break
                 try:
-                    target = self._validate_url(urljoin(target, loc))
+                    target = await asyncio.to_thread(self._validate_url, urljoin(target, loc))
                 except ValueError as exc:
                     return f"ERROR: redirect blocked: {exc}"
                 continue

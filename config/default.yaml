@@ -47,6 +47,7 @@ server:
   host: 127.0.0.1
   port: 8321
   rate_limit_per_minute: 300      # per-IP cap for every /api/* request (0 disables)
+  approval_timeout_seconds: 300   # dangerous-tool approvals wait at most this long
 
 logging:
   level: INFO

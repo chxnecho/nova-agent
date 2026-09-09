@@ -43,7 +43,8 @@ class NoCacheStaticFiles(StaticFiles):
 
 
 HEARTBEAT_SECONDS = 15.0
-SERVER_VERSION = "v10"  # surfaced via /api/sessions so stale processes are detectable
+SERVER_VERSION = "v11"  # surfaced via /api/sessions so stale processes are detectable
+APPROVAL_TIMEOUT_DEFAULT = 300.0  # seconds; override via server.approval_timeout_seconds
 
 
 class ChatBody(BaseModel):
@@ -171,6 +172,7 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
     # Cheap token bucket refreshes every 60s; guards against open abuse when a
     # token is unset / brute-force of the bearer token when it is set.
     RATE_LIMIT_PER_MIN = int(cfg.get("server.rate_limit_per_minute", 300))
+    approval_timeout = float(cfg.get("server.approval_timeout_seconds", APPROVAL_TIMEOUT_DEFAULT))
     app.state.rate_buckets: dict[str, list] = {}
 
     @app.middleware("http")
@@ -249,7 +251,15 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
                         run.approved = False
                         run.approval_event = asyncio.Event()
                         run.emit({"type": "approval_request", "tool": tool_name, "args": args})
-                        await run.approval_event.wait()
+                        try:
+                            # never wait forever: a closed tab / missed click
+                            # must not wedge the run (and leak it) forever
+                            await asyncio.wait_for(
+                                run.approval_event.wait(), timeout=approval_timeout
+                            )
+                        except TimeoutError:
+                            run.emit({"type": "approval_timeout", "tool": tool_name})
+                            return False
                         return run.approved
 
                     agent.approval_callback = approve
@@ -348,6 +358,12 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
         if session.active_run is None:
             return {"ok": True, "note": "nothing running"}
         session.active_run.stop_requested = True
+        # if the run is blocked on a dangerous-tool approval, release the gate
+        # (denied) so the agent reaches its next should_stop checkpoint
+        ev = session.active_run.approval_event
+        if ev is not None and not ev.is_set():
+            session.active_run.approved = False
+            ev.set()
         return {"ok": True}
 
     @app.post("/api/approve/{sid}/{rid}")
@@ -371,6 +387,10 @@ def create_app(cfg: Config | None = None, workspace: str | Path = ".") -> FastAP
             raise HTTPException(404, "unknown session")
         if session.active_run is not None:
             session.active_run.stop_requested = True  # stop work before discarding
+            ev = session.active_run.approval_event
+            if ev is not None and not ev.is_set():
+                session.active_run.approved = False
+                ev.set()  # unblock the awaiting worker so the task can finish
         return {"ok": True}
 
     @app.get("/api/stats/{sid}")

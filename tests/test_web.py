@@ -189,6 +189,138 @@ def test_rate_limit_disabled_when_zero():
             assert r.status_code == 404  # reached handler; not a 429
 
 
+def test_approval_timeout_does_not_wedge_the_run():
+    """A dangerous tool whose approval is never answered must not wedge the
+    run forever: the gate times out (treated as denied) and the run completes."""
+    from nova.llm.base import ToolCall
+    from nova.tools.base import tool
+
+    @tool(
+        name="nuke",
+        description="dangerous test tool",
+        parameters={"type": "object", "properties": {}},
+        danger_level="dangerous",
+    )
+    async def nuke(**_kw) -> str:
+        return "boom"
+
+    app = create_app(
+        Config(
+            {
+                "llm": {"provider": "mock"},
+                "memory": {"enabled": False},
+                "tools": {
+                    "shell": {"enabled": False},
+                    "python_repl": {"enabled": False},
+                    "web": {"enabled": False},
+                },
+                "server": {"approval_timeout_seconds": 0.2},
+            }
+        )
+    )
+    with TestClient(app) as client:
+        sid = client.post("/api/sessions").json()["session_id"]
+        session = app.state.sessions[sid]
+        session.agent.registry.register(nuke)
+        session.provider.enqueue(
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[ToolCall(id="tc1", name="nuke", arguments={})],
+                ),
+                usage=Usage(5, 5),
+                model="mock",
+                finish_reason="tool_calls",
+            )
+        )
+
+        rid = client.post(
+            f"/api/chat/{sid}", json={"message": "go", "confirm_dangerous": True}
+        ).json()["run_id"]
+        # wait for the (short) approval timeout, then replay the buffer
+        import time
+
+        for _ in range(80):
+            if app.state.sessions[sid].runs[rid].done:
+                break
+            time.sleep(0.05)
+        run = app.state.sessions[sid].runs[rid]
+        assert run.done, "run wedged on approval wait (no timeout applied)"
+        kinds = [json.loads(e)["type"] for e in run.events]
+        assert "approval_request" in kinds
+        assert "approval_timeout" in kinds
+        assert kinds[-1] == "done"
+
+
+def test_stop_releases_pending_approval():
+    """/api/stop must unblock a run that is waiting on approval, instead of
+    leaving the worker task hanging on an event nobody will ever set."""
+    from nova.llm.base import ToolCall
+    from nova.tools.base import tool
+
+    @tool(
+        name="nuke",
+        description="dangerous test tool",
+        parameters={"type": "object", "properties": {}},
+        danger_level="dangerous",
+    )
+    async def nuke(**_kw) -> str:
+        return "boom"
+
+    app = create_app(
+        Config(
+            {
+                "llm": {"provider": "mock"},
+                "memory": {"enabled": False},
+                "tools": {
+                    "shell": {"enabled": False},
+                    "python_repl": {"enabled": False},
+                    "web": {"enabled": False},
+                },
+                "server": {"approval_timeout_seconds": 60},
+            }
+        )
+    )
+    with TestClient(app) as client:
+        sid = client.post("/api/sessions").json()["session_id"]
+        session = app.state.sessions[sid]
+        session.agent.registry.register(nuke)
+        session.provider.enqueue(
+            LLMResponse(
+                message=Message(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[ToolCall(id="tc1", name="nuke", arguments={})],
+                ),
+                usage=Usage(5, 5),
+                model="mock",
+                finish_reason="tool_calls",
+            )
+        )
+
+        rid = client.post(
+            f"/api/chat/{sid}", json={"message": "go", "confirm_dangerous": True}
+        ).json()["run_id"]
+        # wait until the approval gate is armed, then stop
+        import time
+
+        for _ in range(80):
+            run = session.runs.get(rid)
+            if run and run.approval_event is not None:
+                break
+            time.sleep(0.02)
+        assert session.runs[rid].approval_event is not None
+        client.post(f"/api/stop/{sid}")
+        for _ in range(100):
+            if session.runs[rid].done:
+                break
+            time.sleep(0.02)
+        assert session.runs[rid].done, "stop could not release the approval wait"
+        final = [json.loads(e) for e in session.runs[rid].events][-2]
+        assert final["type"] == "final" and final["reason"] == "user_stopped"
+
+
 def test_lifespan_startup_shutdown_hygiene():
     """On TestClient context entry the janitor starts; on exit it is cancelled
     and every session's provider is closed (no open clients are left behind)."""
