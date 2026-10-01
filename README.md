@@ -82,9 +82,10 @@ nova/
 ## 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q     # 50 个单元测试,全部离线运行(MockProvider)
+.venv/bin/python -m pytest tests/ -q     # Python 单元测试,全部离线运行(MockProvider)
 .venv/bin/ruff check .                   # lint
 .venv/bin/ruff format --check .          # 格式检查
+node --test                              # 前端 Markdown 模块测试
 scripts/smoke_llm.py                     # 真实 API 冒烟测试(消耗少量 token)
 ```
 
@@ -108,9 +109,9 @@ export NOVA_WEB_TOKEN="$(openssl rand -hex 24)"
   启动时若检测到该目录含 `.env` 会红色告警。
 - **资源治理**:空闲会话 1 小时后自动回收,已完成运行的事件缓冲保留 10 分钟,
   会话总数上限 200(超出时淘汰最旧),无需手动清理。
-- **已知边界**:`web_fetch` 目前允许抓取任意 URL(含内网地址)。面向公网部署时,
-  建议在反向代理层限制出站目标,或在内网环境中禁用该工具(`config/default.yaml`
-  中 `tools.web.enabled: false`)。
+- **出站访问**:`web_fetch` 默认拒绝内网、环回、链路本地和其他非公网地址,
+  并支持 `tools.web.allowed_domains` 域名白名单。只有在明确需要访问内部服务时才应开启
+  `tools.web.allow_private: true`; 面向公网部署时建议保持关闭,或直接禁用该工具。
 
 ## 设计取舍说明
 

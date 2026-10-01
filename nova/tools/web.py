@@ -7,6 +7,7 @@ import html
 import ipaddress
 import re
 import socket
+from collections.abc import Callable
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
@@ -32,10 +33,12 @@ class WebTools:
         allow_private: bool = False,
         allowed_domains: list[str] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        resolver: Callable[..., list] | None = None,
     ):
         self.allow_private = allow_private
         self.allowed_domains = allowed_domains or []
         self.transport = transport  # test hook: e.g. httpx.MockTransport
+        self._resolver = resolver or socket.getaddrinfo  # test hook for DNS resolution
 
     def register(self, registry) -> None:
         registry.register(
@@ -76,7 +79,7 @@ class WebTools:
             raise ValueError(f"host '{host}' is not in tools.web.allowed_domains")
 
         # SSRF guard: refuse non-public destinations
-        if not self.allow_private and _host_is_private(host):
+        if not self.allow_private and _host_is_private(host, self._resolver):
             raise ValueError(
                 f"URL resolves to a private/internal address ('{host}'); "
                 "blocked by the SSRF guard (tools.web.allow_private=false)"
@@ -94,23 +97,24 @@ class WebTools:
         """Resolve `raw`'s hostname and pin the request to a public IP.
 
         Returns (pinned_url, original_hostname). EVERY resolved address must
-        be public, so a multi-record DNS rebinding can't smuggle a private
-        target through between validation and connection. The returned URL
-        has its hostname replaced by the IP; the caller keeps the original
-        hostname in the Host header (and SNI for https).
+        satisfy the configured SSRF policy, so a multi-record DNS rebinding
+        can't smuggle a disallowed target through between validation and
+        connection. The returned URL has its hostname replaced by the IP; the
+        caller keeps the original hostname in the Host header (and SNI for https).
         """
         parsed = urlparse(raw)
         host = parsed.hostname or ""
         port = parsed.port
-        infos = socket.getaddrinfo(host, port)
+        infos = self._resolver(host, port)
         ips = {info[4][0] for info in infos}
         public: str | None = None
         for ip in ips:
             addr = ipaddress.ip_address(ip)
             if (
-                addr.is_private
-                or addr.is_loopback
-                or addr.is_link_local
+                (
+                    not self.allow_private
+                    and (addr.is_private or addr.is_loopback or addr.is_link_local)
+                )
                 or addr.is_reserved
                 or addr.is_multicast
                 or addr.is_unspecified
@@ -174,10 +178,10 @@ class WebTools:
         return f"[HTTP {resp.status_code} | {ctype.split(';')[0]}]\n{body[:limit]}"
 
 
-def _host_is_private(host: str) -> bool:
+def _host_is_private(host: str, resolver: Callable[..., list] | None = None) -> bool:
     """True when host resolves (or fails to resolve) to a non-public address."""
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = (resolver or socket.getaddrinfo)(host, None)
     except socket.gaierror:
         return True  # unresolvable -> fail closed
     for info in infos:

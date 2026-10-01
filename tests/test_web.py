@@ -1,6 +1,8 @@
+import asyncio
 import json
+from contextlib import asynccontextmanager
 
-from fastapi.testclient import TestClient
+import httpx
 from nova.config import Config
 from nova.llm.base import LLMResponse, Message, Usage
 from nova.web.server import create_app
@@ -30,143 +32,156 @@ def make_app():
     return create_app(cfg)
 
 
-def test_auth_required_when_token_set(monkeypatch):
+@asynccontextmanager
+async def client_for(app):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        yield client
+
+
+@asynccontextmanager
+async def app_client(app):
+    async with app.router.lifespan_context(app), client_for(app) as client:
+        yield client
+
+
+async def wait_until(predicate, attempts=50, delay=0.02):
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await asyncio.sleep(delay)
+    return predicate()
+
+
+def sessions_of(app):
+    return app.state.sessions
+
+
+async def test_auth_required_when_token_set(monkeypatch):
     """With NOVA_WEB_TOKEN set, /api endpoints demand the bearer token,
     while the page and static assets stay publicly loadable."""
     monkeypatch.setenv("NOVA_WEB_TOKEN", "s3cret")
     app = make_app()
-    client = TestClient(app)
-
-    assert client.get("/api/history/nope").status_code == 401
-    assert (
-        client.get("/api/history/nope", headers={"Authorization": "Bearer wrong"}).status_code
-        == 401
-    )
-    # page itself is still public so the browser can render the UI
-    assert client.get("/").status_code == 200
-    # correct token passes through to normal handling (404: unknown session)
-    r = client.get("/api/history/nope", headers={"Authorization": "Bearer s3cret"})
-    assert r.status_code == 404
+    async with app_client(app) as client:
+        assert (await client.get("/api/history/nope")).status_code == 401
+        assert (
+            await client.get("/api/history/nope", headers={"Authorization": "Bearer wrong"})
+        ).status_code == 401
+        # page itself is still public so the browser can render the UI
+        assert (await client.get("/")).status_code == 200
+        # correct token passes through to normal handling (404: unknown session)
+        response = await client.get("/api/history/nope", headers={"Authorization": "Bearer s3cret"})
+        assert response.status_code == 404
 
 
-def test_no_auth_when_token_unset(monkeypatch):
+async def test_no_auth_when_token_unset(monkeypatch):
     monkeypatch.delenv("NOVA_WEB_TOKEN", raising=False)
-    client = TestClient(make_app())
-    r = client.get("/api/history/nope")
-    assert r.status_code == 404  # reaches handler: unknown session, not 401
-
-
-def test_index_page_served():
-    client = TestClient(create_app(Config({"memory": {"enabled": False}})))
-    r = client.get("/")
-    assert r.status_code == 200
-    assert "NovaAgent" in r.text
-
-
-def test_chat_stream_end_to_end():
     app = make_app()
-    client = TestClient(app)
-
-    sid = client.post("/api/sessions").json()["session_id"]
-
-    # step 1: start the run
-    r = client.post(f"/api/chat/{sid}", json={"message": "hello agent"})
-    assert r.status_code == 200
-    run_id = r.json()["run_id"]
-
-    # give the background task a moment, then replay the event buffer
-    import time
-
-    for _ in range(50):
-        if sessions_of(client)[sid].runs[run_id].done:
-            break
-        time.sleep(0.02)
-
-    r2 = client.get(f"/api/stream/{sid}/{run_id}")
-    assert r2.status_code == 200
-    assert r2.headers["content-type"].startswith("text/event-stream")
-
-    events = [json.loads(line[6:]) for line in r2.text.splitlines() if line.startswith("data: ")]
-    kinds = [e["type"] for e in events]
-    assert "final" in kinds
-    final = next(e for e in events if e["type"] == "final")
-    assert "[mock] You said: hello agent" in final["text"]
-    assert kinds[-1] == "done"
+    async with app_client(app) as client:
+        response = await client.get("/api/history/nope")
+        assert response.status_code == 404  # reaches handler: unknown session, not 401
 
 
-def sessions_of(_client):
-    """Reach into the app's session store via the TestClient's app reference."""
-    return _client.app.state.sessions
+async def test_index_page_served():
+    app = create_app(Config({"memory": {"enabled": False}}))
+    async with app_client(app) as client:
+        response = await client.get("/")
+        assert response.status_code == 200
+        assert "NovaAgent" in response.text
 
 
-def test_stream_replay_is_stable():
+async def test_chat_stream_end_to_end():
+    app = make_app()
+    async with app_client(app) as client:
+        sid = (await client.post("/api/sessions")).json()["session_id"]
+
+        # step 1: start the run
+        response = await client.post(f"/api/chat/{sid}", json={"message": "hello agent"})
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+
+        # give the background task a moment, then replay the event buffer
+        assert await wait_until(lambda: sessions_of(app)[sid].runs[run_id].done)
+
+        stream_response = await client.get(f"/api/stream/{sid}/{run_id}")
+        assert stream_response.status_code == 200
+        assert stream_response.headers["content-type"].startswith("text/event-stream")
+
+        events = [
+            json.loads(line[6:])
+            for line in stream_response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        kinds = [event["type"] for event in events]
+        assert "final" in kinds
+        final = next(event for event in events if event["type"] == "final")
+        assert "[mock] You said: hello agent" in final["text"]
+        assert kinds[-1] == "done"
+
+
+async def test_stream_replay_is_stable():
     """The same run can be streamed repeatedly (reconnect/replay support)."""
     app = make_app()
-    client = TestClient(app)
-    import time
+    async with app_client(app) as client:
+        sid = (await client.post("/api/sessions")).json()["session_id"]
+        run_id = (await client.post(f"/api/chat/{sid}", json={"message": "hi"})).json()["run_id"]
+        assert await wait_until(lambda: sessions_of(app)[sid].runs[run_id].done)
 
-    sid = client.post("/api/sessions").json()["session_id"]
-    rid = client.post(f"/api/chat/{sid}", json={"message": "hi"}).json()["run_id"]
-    for _ in range(50):
-        if sessions_of(client)[sid].runs[rid].done:
-            break
-        time.sleep(0.02)
-
-    t1 = client.get(f"/api/stream/{sid}/{rid}").text
-    t2 = client.get(f"/api/stream/{sid}/{rid}").text
-    assert t1 == t2 and "final" in t1
+        first = (await client.get(f"/api/stream/{sid}/{run_id}")).text
+        second = (await client.get(f"/api/stream/{sid}/{run_id}")).text
+        assert first == second and "final" in first
 
 
-def test_unknown_session_404():
-    client = TestClient(make_app())
-    r = client.post("/api/chat/nonexistent", json={"message": "hi"})
-    assert r.status_code == 404
+async def test_unknown_session_404():
+    app = make_app()
+    async with app_client(app) as client:
+        response = await client.post("/api/chat/nonexistent", json={"message": "hi"})
+        assert response.status_code == 404
 
 
-def test_stats_endpoint():
-    client = TestClient(make_app())
-    sid = client.post("/api/sessions").json()["session_id"]
-    stats = client.get(f"/api/stats/{sid}").json()
-    assert stats["model"] == "mock-model"
-    assert stats["total_tokens"] == 0
+async def test_stats_endpoint():
+    app = make_app()
+    async with app_client(app) as client:
+        sid = (await client.post("/api/sessions")).json()["session_id"]
+        stats = (await client.get(f"/api/stats/{sid}")).json()
+        assert stats["model"] == "mock-model"
+        assert stats["total_tokens"] == 0
 
 
-def test_stop_endpoint():
-    client = TestClient(make_app())
-    sid = client.post("/api/sessions").json()["session_id"]
-    r = client.post(f"/api/stop/{sid}")
-    assert r.status_code == 200
-    assert r.json()["ok"] is True
-    r = client.post("/api/stop/nonexistent")
-    assert r.status_code == 404
+async def test_stop_endpoint():
+    app = make_app()
+    async with app_client(app) as client:
+        sid = (await client.post("/api/sessions")).json()["session_id"]
+        response = await client.post(f"/api/stop/{sid}")
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        response = await client.post("/api/stop/nonexistent")
+        assert response.status_code == 404
 
 
-def test_events_polling_endpoint():
+async def test_events_polling_endpoint():
     """Polling endpoint returns incremental events + done flag."""
     app = make_app()
-    client = TestClient(app)
-    import time
+    async with app_client(app) as client:
+        sid = (await client.post("/api/sessions")).json()["session_id"]
+        run_id = (await client.post(f"/api/chat/{sid}", json={"message": "poll me"})).json()[
+            "run_id"
+        ]
+        assert await wait_until(lambda: sessions_of(app)[sid].runs[run_id].done)
 
-    sid = client.post("/api/sessions").json()["session_id"]
-    rid = client.post(f"/api/chat/{sid}", json={"message": "poll me"}).json()["run_id"]
-    for _ in range(50):
-        if client.app.state.sessions[sid].runs[rid].done:
-            break
-        time.sleep(0.02)
+        events = (await client.get(f"/api/events/{sid}/{run_id}?after=0")).json()
+        types = [event["type"] for event in events["events"]]
+        assert "final" in types and events["done"] is True
 
-    j = client.get(f"/api/events/{sid}/{rid}?after=0").json()
-    types = [e["type"] for e in j["events"]]
-    assert "final" in types and j["done"] is True
+        # after=1 skips the first event but still returns the rest
+        remaining = (await client.get(f"/api/events/{sid}/{run_id}?after=1")).json()
+        assert len(remaining["events"]) == len(events["events"]) - 1
 
-    # after=1 skips the first event but still returns the rest
-    j2 = client.get(f"/api/events/{sid}/{rid}?after=1").json()
-    assert len(j2["events"]) == len(j["events"]) - 1
-
-    r = client.get("/api/events/nonexistent/x")
-    assert r.status_code == 404
+        response = await client.get("/api/events/nonexistent/x")
+        assert response.status_code == 404
 
 
-def test_rate_limit_disabled_when_zero():
+async def test_rate_limit_disabled_when_zero():
     """rate_limit_per_minute:0 semantics: disabled (not 'deny everything')."""
     app = create_app(
         Config(
@@ -182,14 +197,14 @@ def test_rate_limit_disabled_when_zero():
             }
         )
     )
-    with TestClient(app) as client:
+    async with app_client(app) as client:
         # all requests pass through even though the limit is set to "0"
         for _ in range(10):
-            r = client.get("/api/history/nope")
-            assert r.status_code == 404  # reached handler; not a 429
+            response = await client.get("/api/history/nope")
+            assert response.status_code == 404  # reached handler; not a 429
 
 
-def test_approval_timeout_does_not_wedge_the_run():
+async def test_approval_timeout_does_not_wedge_the_run():
     """A dangerous tool whose approval is never answered must not wedge the
     run forever: the gate times out (treated as denied) and the run completes."""
     from nova.llm.base import ToolCall
@@ -218,8 +233,8 @@ def test_approval_timeout_does_not_wedge_the_run():
             }
         )
     )
-    with TestClient(app) as client:
-        sid = client.post("/api/sessions").json()["session_id"]
+    async with app_client(app) as client:
+        sid = (await client.post("/api/sessions")).json()["session_id"]
         session = app.state.sessions[sid]
         session.agent.registry.register(nuke)
         session.provider.enqueue(
@@ -235,25 +250,19 @@ def test_approval_timeout_does_not_wedge_the_run():
             )
         )
 
-        rid = client.post(
-            f"/api/chat/{sid}", json={"message": "go", "confirm_dangerous": True}
+        run_id = (
+            await client.post(f"/api/chat/{sid}", json={"message": "go", "confirm_dangerous": True})
         ).json()["run_id"]
-        # wait for the (short) approval timeout, then replay the buffer
-        import time
+        assert await wait_until(lambda: app.state.sessions[sid].runs[run_id].done, 80, 0.05)
 
-        for _ in range(80):
-            if app.state.sessions[sid].runs[rid].done:
-                break
-            time.sleep(0.05)
-        run = app.state.sessions[sid].runs[rid]
-        assert run.done, "run wedged on approval wait (no timeout applied)"
-        kinds = [json.loads(e)["type"] for e in run.events]
+        run = app.state.sessions[sid].runs[run_id]
+        kinds = [json.loads(event)["type"] for event in run.events]
         assert "approval_request" in kinds
         assert "approval_timeout" in kinds
         assert kinds[-1] == "done"
 
 
-def test_stop_releases_pending_approval():
+async def test_stop_releases_pending_approval():
     """/api/stop must unblock a run that is waiting on approval, instead of
     leaving the worker task hanging on an event nobody will ever set."""
     from nova.llm.base import ToolCall
@@ -282,8 +291,8 @@ def test_stop_releases_pending_approval():
             }
         )
     )
-    with TestClient(app) as client:
-        sid = client.post("/api/sessions").json()["session_id"]
+    async with app_client(app) as client:
+        sid = (await client.post("/api/sessions")).json()["session_id"]
         session = app.state.sessions[sid]
         session.agent.registry.register(nuke)
         session.provider.enqueue(
@@ -299,44 +308,39 @@ def test_stop_releases_pending_approval():
             )
         )
 
-        rid = client.post(
-            f"/api/chat/{sid}", json={"message": "go", "confirm_dangerous": True}
+        run_id = (
+            await client.post(f"/api/chat/{sid}", json={"message": "go", "confirm_dangerous": True})
         ).json()["run_id"]
-        # wait until the approval gate is armed, then stop
-        import time
+        assert await wait_until(
+            lambda: session.runs.get(run_id) and session.runs[run_id].approval_event is not None,
+            80,
+        )
+        await client.post(f"/api/stop/{sid}")
+        assert await wait_until(lambda: session.runs[run_id].done, 100)
 
-        for _ in range(80):
-            run = session.runs.get(rid)
-            if run and run.approval_event is not None:
-                break
-            time.sleep(0.02)
-        assert session.runs[rid].approval_event is not None
-        client.post(f"/api/stop/{sid}")
-        for _ in range(100):
-            if session.runs[rid].done:
-                break
-            time.sleep(0.02)
-        assert session.runs[rid].done, "stop could not release the approval wait"
-        final = [json.loads(e) for e in session.runs[rid].events][-2]
+        final = [json.loads(event) for event in session.runs[run_id].events][-2]
         assert final["type"] == "final" and final["reason"] == "user_stopped"
 
 
-def test_host_guard_blocks_rebinding_domain():
+async def test_host_guard_blocks_rebinding_domain():
     """DNS-rebinding defense: a public *domain* Host header is rejected while
     loopback/private IPs, localhost and single-label names pass through."""
-    client = TestClient(make_app())
-    # rebinding-style request: domain Host header -> 403 on API and page alike
-    assert client.get("/api/history/nope", headers={"Host": "evil.com"}).status_code == 403
-    assert client.get("/", headers={"Host": "evil.com"}).status_code == 403
-    # legitimate local access patterns pass
-    assert client.get("/", headers={"Host": "localhost:8321"}).status_code == 200
-    assert client.get("/", headers={"Host": "127.0.0.1:8321"}).status_code == 200
-    assert client.get("/", headers={"Host": "192.168.1.5:8321"}).status_code == 200
-    # default TestClient host ("testserver", single label) keeps working
-    assert client.get("/").status_code == 200
+    app = make_app()
+    async with app_client(app) as client:
+        # rebinding-style request: domain Host header -> 403 on API and page alike
+        assert (
+            await client.get("/api/history/nope", headers={"Host": "evil.com"})
+        ).status_code == 403
+        assert (await client.get("/", headers={"Host": "evil.com"})).status_code == 403
+        # legitimate local access patterns pass
+        assert (await client.get("/", headers={"Host": "localhost:8321"})).status_code == 200
+        assert (await client.get("/", headers={"Host": "127.0.0.1:8321"})).status_code == 200
+        assert (await client.get("/", headers={"Host": "192.168.1.5:8321"})).status_code == 200
+        # default ASGI test host (single label) keeps working
+        assert (await client.get("/")).status_code == 200
 
 
-def test_host_guard_allows_configured_domain():
+async def test_host_guard_allows_configured_domain():
     app = create_app(
         Config(
             {
@@ -351,37 +355,38 @@ def test_host_guard_allows_configured_domain():
             }
         )
     )
-    client = TestClient(app)
-    r = client.get("/api/history/nope", headers={"Host": "nova.example.com"})
-    assert r.status_code == 404  # passed the guard; unknown session
-    assert client.get("/api/history/nope", headers={"Host": "other.com"}).status_code == 403
+    async with app_client(app) as client:
+        response = await client.get("/api/history/nope", headers={"Host": "nova.example.com"})
+        assert response.status_code == 404  # passed the guard; unknown session
+        response = await client.get("/api/history/nope", headers={"Host": "other.com"})
+        assert response.status_code == 403
 
 
-def test_lifespan_startup_shutdown_hygiene():
-    """On TestClient context entry the janitor starts; on exit it is cancelled
-    and every session's provider is closed (no open clients are left behind)."""
+async def test_lifespan_startup_shutdown_hygiene():
+    """On lifespan entry the janitor starts; on exit it is cancelled and every
+    session's provider is closed (no open clients are left behind)."""
     app = make_app()
-    client = TestClient(app)
     sid = None
-    with client:
+    async with app.router.lifespan_context(app):
         assert not app.state.janitor_task.done()
-        sid = client.post("/api/sessions").json()["session_id"]
-        assert len(app.state.sessions) == 1
+        async with client_for(app) as client:
+            sid = (await client.post("/api/sessions")).json()["session_id"]
+            assert len(app.state.sessions) == 1
     # shutdown ran: sessions drained, provider closed, janitor cancelled
     assert len(app.state.sessions) == 0
     assert app.state.janitor_task.done()
     assert sid is not None
 
 
-def test_delete_session_endpoint():
+async def test_delete_session_endpoint():
     app = make_app()
-    client = TestClient(app)
-    sid = client.post("/api/sessions").json()["session_id"]
+    async with app_client(app) as client:
+        sid = (await client.post("/api/sessions")).json()["session_id"]
 
-    r = client.delete(f"/api/sessions/{sid}")
-    assert r.status_code == 200
-    assert r.json()["ok"] is True
+        response = await client.delete(f"/api/sessions/{sid}")
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
 
-    # session gone: chat now 404s, delete again also 404s
-    assert client.post(f"/api/chat/{sid}", json={"message": "x"}).status_code == 404
-    assert client.delete(f"/api/sessions/{sid}").status_code == 404
+        # session gone: chat now 404s, delete again also 404s
+        assert (await client.post(f"/api/chat/{sid}", json={"message": "x"})).status_code == 404
+        assert (await client.delete(f"/api/sessions/{sid}")).status_code == 404

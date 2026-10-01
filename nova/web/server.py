@@ -18,7 +18,7 @@ import json
 import os
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -133,6 +133,8 @@ def _build_lifespan(sessions: dict[str, Session]):
             yield
         finally:
             task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
             # shutdown hygiene: close every remaining provider/client
             for sid in list(sessions):
                 s = sessions.pop(sid, None)

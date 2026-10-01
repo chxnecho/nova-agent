@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### 修复
+- **测试兼容性**：Web 测试改用 `httpx.ASGITransport` 和显式 lifespan 管理，避免新版
+  Starlette `TestClient` 在 Python 3.14 环境中挂起；DNS 测试改用可注入 resolver。
+- **私网访问开关**：`tools.web.allow_private` 现在会贯穿 URL 校验和实际 DNS pin 请求。
+- **生命周期清理**：Web 服务关闭时等待 janitor 任务完成取消，避免残留 cancelling task。
+- **CLI 一致性**：交互式 `chat` 复用 `Agent.run()`，使预算、反思、历史压缩和 trace 行为一致。
+
 ### 安全加固 (hardening)
 - **SSRF 防护**：`web_fetch` 默认拒绝私网/环回/链路本地/保留/组播地址;手动跟随重定向并对每一跳重新校验;新增 `tools.web.allowed_domains` 域名白名单与 `tools.web.allow_private` 开关。
 - **Shell 加固**：黑名单改为空白规范化匹配(堵住 `rm -rf  /` 类绕过),并拒绝向 workspace 之外的绝对路径写入(`workspace_root` 守卫)。

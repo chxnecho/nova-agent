@@ -110,10 +110,21 @@ def test_web_blocks_non_http_scheme():
 
 
 def test_web_allow_private_opt_in():
+    import httpx
     from nova.tools.web import WebTools
 
-    wt = WebTools(allow_private=True)
+    def fake_getaddrinfo(host, port, *a, **kw):
+        import socket
+
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port or 0))]
+
+    wt = WebTools(
+        allow_private=True,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, text="private-ok")),
+        resolver=fake_getaddrinfo,
+    )
     assert wt._validate_url("http://127.0.0.1:8080/x") == "http://127.0.0.1:8080/x"
+    assert "private-ok" in asyncio.run(wt.fetch("http://internal.test/x"))
 
 
 def test_web_allowed_domains_deny():
@@ -124,7 +135,7 @@ def test_web_allowed_domains_deny():
         wt._validate_url("http://evil.example.net/x")
 
 
-def test_fetch_pins_ip_and_keeps_host(monkeypatch):
+def test_fetch_pins_ip_and_keeps_host():
     """The request must go to the *resolved IP* while keeping the original
     hostname in the Host header — closing the resolve-then-connect race."""
     import socket
@@ -136,8 +147,6 @@ def test_fetch_pins_ip_and_keeps_host(monkeypatch):
     def fake_getaddrinfo(host, port, *a, **kw):
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))]
 
-    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
-
     def handler(request: httpx.Request) -> httpx.Response:
         captured["url"] = str(request.url)
         captured["host_header"] = request.headers.get("host")
@@ -145,7 +154,7 @@ def test_fetch_pins_ip_and_keeps_host(monkeypatch):
 
     from nova.tools.web import WebTools
 
-    wt = WebTools(transport=httpx.MockTransport(handler))
+    wt = WebTools(transport=httpx.MockTransport(handler), resolver=fake_getaddrinfo)
     out = asyncio.run(wt.fetch("http://example.com/hello"))
 
     assert "pinned-ok" in out
@@ -153,7 +162,7 @@ def test_fetch_pins_ip_and_keeps_host(monkeypatch):
     assert captured["host_header"] == "example.com"
 
 
-def test_fetch_rejects_multi_record_rebinding(monkeypatch):
+def test_fetch_rejects_multi_record_rebinding():
     """A hostname resolving to one public + one private address is rejected:
     both records must be public (multi-record rebinding defense)."""
     import socket
@@ -166,14 +175,13 @@ def test_fetch_rejects_multi_record_rebinding(monkeypatch):
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.1", port or 0)),
         ]
 
-    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
-
     from nova.tools.web import WebTools
 
     wt = WebTools(
         transport=httpx.MockTransport(
             lambda request: httpx.Response(200, text="should not get here")
-        )
+        ),
+        resolver=fake_getaddrinfo,
     )
     out = asyncio.run(wt.fetch("http://rebind.example/hello"))
     assert out.startswith("ERROR:")

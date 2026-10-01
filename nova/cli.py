@@ -15,7 +15,6 @@ from pathlib import Path
 
 from nova.agent.core import build_default_agent
 from nova.config import api_key_for, load_config
-from nova.llm.base import Message
 from nova.llm.provider import create_provider_from_config
 from nova.log import setup_logging
 
@@ -30,6 +29,17 @@ def _print_step(step) -> None:
         print(f"\033[90m{obs}{'...' if len(step.observation or '') > 800 else ''}\033[0m")
     elif step.kind == "final":
         print(f"\n\033[32m[final | {step.duration_s:.1f}s]\033[0m")
+
+
+def _print_chat_step(step) -> None:
+    """Show tool activity in chat mode; response text is streamed separately."""
+    if step.kind != "act":
+        return
+    args = ", ".join(f"{k}={str(v)[:80]!r}" for k, v in (step.tool_args or {}).items())
+    print(f"\n\033[33m[{step.tool_name}({args})]\033[0m")
+    observation = (step.observation or "")[:800]
+    suffix = "..." if len(step.observation or "") > 800 else ""
+    print(f"\033[90m{observation}{suffix}\033[0m")
 
 
 async def cmd_run(cfg, task: str, workspace: Path) -> int:
@@ -84,50 +94,52 @@ async def cmd_team(cfg, task: str, workspace: Path) -> int:
 
 async def cmd_chat(cfg, workspace: Path) -> int:
     provider = create_provider_from_config(cfg, api_key_for(cfg))
-    agent = build_default_agent(cfg, provider, workspace=workspace)
-    agent.reset()
-    print("NovaAgent interactive mode. Type 'exit' to quit, '/reset' to clear context.\n")
+    try:
+        agent = build_default_agent(cfg, provider, workspace=workspace)
+        agent.reset()
+        agent.on_step = _print_chat_step
+        print("NovaAgent interactive mode. Type 'exit' to quit, '/reset' to clear context.\n")
 
-    while True:
-        try:
-            user = input("\033[35myou>\033[0m ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not user:
-            continue
-        if user.lower() in ("exit", "quit", "q"):
-            break
-        if user == "/reset":
-            agent.reset()
-            print("(context cleared)\n")
-            continue
+        while True:
+            try:
+                user = input("\033[35myou>\033[0m ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not user:
+                continue
+            if user.lower() in ("exit", "quit", "q"):
+                break
+            if user == "/reset":
+                agent.reset()
+                print("(context cleared)\n")
+                continue
 
-        # multi-turn: reuse history, but strip the previous user task framing
-        agent.history.append(Message(role="user", content=user))
-        try:
-            while True:
-                resp = await provider.chat(
-                    agent.history,
-                    tools=agent.registry.schemas(),
-                    stream_callback=lambda d: print(d, end="", flush=True),
-                )
+            streamed: list[str] = []
+
+            def stream_delta(delta: str, buffer: list[str] = streamed) -> None:
+                buffer.append(delta)
+                print(delta, end="", flush=True)
+
+            agent.stream_callback = stream_delta
+            try:
+                result = await agent.run(user)
+            except KeyboardInterrupt:
+                print("\n(interrupted)")
+                continue
+
+            # OpenAI-compatible providers stream the final answer, while the
+            # offline mock returns it directly. Avoid duplicating streamed text.
+            if streamed and "".join(streamed).endswith(result.final_answer):
                 print()
-                msg = resp.message
-                agent.history.append(msg)
-                if not msg.tool_calls:
-                    break
-                for tc in msg.tool_calls:
-                    observation = await agent.registry.execute(tc)
-                    print(f"\033[90m[{tc.name}] {observation[:400]}\033[0m")
-                    agent.history.append(
-                        Message(role="tool", content=observation, tool_call_id=tc.id, name=tc.name)
-                    )
-        except KeyboardInterrupt:
-            print("\n(interrupted)")
-        usage = provider.total_usage
-        print(f"\033[90m-- session tokens: {usage.total_tokens} --\033[0m\n")
-
-    await provider.aclose()
+            else:
+                print(result.final_answer)
+            usage = provider.total_usage
+            print(
+                f"\033[90m-- session tokens: {usage.total_tokens}; "
+                f"reason: {result.stopped_reason} --\033[0m\n"
+            )
+    finally:
+        await provider.aclose()
     return 0
 
 
